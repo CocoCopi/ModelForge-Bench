@@ -20,6 +20,13 @@
         <provider android:authorities="com.modelforge.app.models" />
     </queries>
 
+    <!-- Read-only run history for ModelForge series comparisons. -->
+    <permission
+        android:name="com.modelforge.bench.permission.READ_RUNS"
+        android:label="@string/read_runs_permission_label"
+        android:description="@string/read_runs_permission_description"
+        android:protectionLevel="dangerous" />
+
     <application
         android:name=".BenchApp"
         android:allowBackup="false"
@@ -62,6 +69,14 @@
             android:name=".service.EvalService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <provider
+            android:name=".source.RunsProvider"
+            android:authorities="com.modelforge.bench.runs"
+            android:enabled="true"
+            android:exported="true"
+            android:grantUriPermissions="false"
+            android:permission="com.modelforge.bench.permission.READ_RUNS" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

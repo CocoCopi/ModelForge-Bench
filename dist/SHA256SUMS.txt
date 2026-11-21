@@ -1,0 +1,1 @@
+8626b8274690c72a94dac91e1a5e10f60902f4e4029cc537b8c596809d9055cc  dist/ModelForge-Bench-1.0.0-arm64-v8a.apk

@@ -109,8 +109,8 @@ jobs:
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk \
-            "dist/ModelForge-Bench-1.0.0-arm64-v8a.apk"
-          echo "path=dist/ModelForge-Bench-1.0.0-arm64-v8a.apk" >> "$GITHUB_OUTPUT"
+            "dist/ModelForge-Bench-${GITHUB_REF_NAME#v}-arm64-v8a.apk"
+          echo "path=dist/ModelForge-Bench-${GITHUB_REF_NAME#v}-arm64-v8a.apk" >> "$GITHUB_OUTPUT"
           sha256sum dist/*.apk | tee dist/SHA256SUMS.txt
 
       - name: Upload APK artifact

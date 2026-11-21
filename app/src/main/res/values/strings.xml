@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ModelForge Bench</string>
+    <string name="read_runs_permission_label">Read benchmark results</string>
+    <string name="read_runs_permission_description">Allows ModelForge to read your benchmark scores.</string>
 </resources>

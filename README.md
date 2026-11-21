@@ -5,7 +5,7 @@ Commercial-grade, fully offline evaluation for models trained with
 phone that trained the model, with the same C++ engine, so a score is a
 measurement rather than an estimate.
 
-**Package:** `com.modelforge.bench` · **Version:** 1.0.0 · **minSdk 26, target 34**
+**Package:** `com.modelforge.bench` · **Version:** 1.0.1 · **minSdk 26, target 34**
 **License:** Apache-2.0
 
 ## What it measures
@@ -60,6 +60,15 @@ Each run writes JSON (archival), CSV (spreadsheets), HTML (reading and
 printing) and PDF (sign-off). Reports include the model hash, full device
 profile, engine version, run mode, seed, item counts, warnings and every raw
 metric used by the composite score.
+
+## ModelForge integration
+
+Bench 1.0.1 exposes completed run summaries through the read-only
+`com.modelforge.bench.runs` provider, guarded by the dangerous
+`com.modelforge.bench.permission.READ_RUNS` permission. ModelForge 2.4.1+ uses
+it to show every version in a series next to its composite score, accuracy,
+perplexity and decode speed, and to explain which measured weakness shaped the
+next version's training budget.
 
 ## Privacy
 
