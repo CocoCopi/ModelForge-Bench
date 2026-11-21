@@ -1,0 +1,2371 @@
+#include "core/gpt.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <thread>
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+namespace mf {
+
+namespace {
+
+constexpr float kLnEps = 1e-5f;
+constexpr float kGeluC = 0.7978845608028654f;  // sqrt(2/pi)
+constexpr float kGeluK = 0.044715f;
+
+// Fixed sinusoidal positions. Unlike a learned table this costs no parameters
+// and no context-sized allocation, so long contexts only pay for activations.
+inline void add_positional(int pos, int d, float* x) {
+    for (int p = 0; 2 * p < d; ++p) {
+        const double freq = std::pow(10000.0, -2.0 * static_cast<double>(p) /
+                                                  static_cast<double>(d));
+        const double angle = static_cast<double>(pos) * freq;
+        x[2 * p] += static_cast<float>(std::sin(angle));
+        if (2 * p + 1 < d) x[2 * p + 1] += static_cast<float>(std::cos(angle));
+    }
+}
+
+// Every entry point that accepts caller-supplied token ids must fail closed:
+// an out-of-range id indexes embedding rows and, during backward, writes past
+// the gradient buffer. Checking B*T ids is negligible next to a training step.
+bool tokens_in_range(const int* tokens, int count, int vocab) {
+    if (tokens == nullptr || count <= 0 || vocab <= 0) return false;
+    for (int i = 0; i < count; ++i) {
+        if (tokens[i] < 0 || tokens[i] >= vocab) return false;
+    }
+    return true;
+}
+
+bool targets_in_range(const int* targets, int count, int vocab) {
+    if (targets == nullptr || count <= 0 || vocab <= 0) return false;
+    for (int i = 0; i < count; ++i) {
+        if (targets[i] < 0 || targets[i] >= vocab) return false;
+    }
+    return true;
+}
+
+int hardware_threads() {
+    static int cached = [] {
+        int hc = static_cast<int>(std::thread::hardware_concurrency());
+        if (hc < 1) hc = 1;
+        if (hc > 8) hc = 8;
+        return hc;
+    }();
+    return cached;
+}
+
+// Persistent worker pool. Training is single-threaded from the caller's point of
+// view, so one shared pool is enough and avoids paying thread creation cost for
+// every small matrix multiply.
+class ThreadPool {
+public:
+    static ThreadPool& instance() {
+        static ThreadPool* pool = new ThreadPool();
+        return *pool;
+    }
+
+    // Runs fn(0..n-1) on the shared pool and blocks until all indices finish.
+    //
+    // The pool is process-global, so several GPT/PackedModel instances can call
+    // this concurrently (training in the foreground service while the
+    // playground generates). Per-call state therefore lives in a heap Call
+    // object owned by shared_ptr; nothing refers to this stack frame after a
+    // task is queued. Whole regions are serialized by region_mu_ because the
+    // worker pool has no notion of task ownership, and a worker must never
+    // start a nested region (this would deadlock with every worker busy).
+    void run(int n, const std::function<void(int)>& fn, int min_parallel) {
+        if (n <= 0) return;
+        const int workers = static_cast<int>(threads_.size());
+        if (workers <= 0 || n < min_parallel) {
+            run_inline(n, fn);
+            return;
+        }
+
+        std::lock_guard<std::mutex> region(region_mu_);
+        auto call = std::make_shared<Call>();
+        call->fn = &fn;
+        call->n = n;
+
+        const int w = std::min(workers, n);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            call->remaining = w;
+            for (int t = 0; t < w; ++t) {
+                tasks_.emplace_back([this, call] { execute(call); });
+            }
+        }
+        cv_.notify_all();
+
+        std::unique_lock<std::mutex> lk(call->done_mu);
+        call->done_cv.wait(lk, [&] { return call->finished; });
+        lk.unlock();
+        if (call->error) std::rethrow_exception(call->error);
+    }
+
+private:
+    struct Call {
+        const std::function<void(int)>* fn = nullptr;
+        int n = 0;
+        int remaining = 0;
+        std::atomic<int> next{0};
+        std::atomic<bool> failed{false};
+        std::mutex done_mu;
+        std::condition_variable done_cv;
+        bool finished = false;
+        std::exception_ptr error;
+    };
+
+    static void run_inline(int n, const std::function<void(int)>& fn) {
+        // Preserve the first exception so callers see a deterministic failure
+        // instead of a partially applied parallel region.
+        std::exception_ptr first;
+        for (int i = 0; i < n; ++i) {
+            try {
+                fn(i);
+            } catch (...) {
+                if (!first) first = std::current_exception();
+            }
+        }
+        if (first) std::rethrow_exception(first);
+    }
+
+    void execute(const std::shared_ptr<Call>& call) {
+        for (;;) {
+            if (call->failed.load(std::memory_order_relaxed)) break;
+            const int i = call->next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= call->n) break;
+            try {
+                (*call->fn)(i);
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lk(call->done_mu);
+                    if (!call->error) call->error = std::current_exception();
+                }
+                call->failed.store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> lk(call->done_mu);
+        if (--call->remaining == 0) {
+            call->finished = true;
+            call->done_cv.notify_all();
+        }
+    }
+
+    ThreadPool() {
+        const int nt = hardware_threads();
+        for (int i = 0; i < nt; ++i) {
+            threads_.emplace_back([this] { worker(); });
+        }
+    }
+
+    void worker() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return !tasks_.empty(); });
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            // Tasks must never throw: execute() already captures callable
+            // exceptions, so an escape here would be unrecoverable.
+            try {
+                task();
+            } catch (...) {
+            }
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::deque<std::function<void()>> tasks_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::mutex region_mu_;
+};
+
+template <typename Fn>
+void parallel_for(int n, Fn&& fn) {
+    ThreadPool::instance().run(n, std::function<void(int)>(fn), 64);
+}
+
+template <typename Fn>
+void parallel_for_any(int n, Fn&& fn) {
+    ThreadPool::instance().run(n, std::function<void(int)>(fn), 1);
+}
+
+inline float dot_f32(const float* a, const float* b, int n) {
+#if defined(__aarch64__)
+    // Four independent accumulators: a single FMA chain stalls on its own
+    // latency (the A55 needs several cycles per FMA), which is why the old
+    // one-accumulator loop only reached a fraction of the core's throughput.
+    float32x4_t s0 = vdupq_n_f32(0.0f);
+    float32x4_t s1 = vdupq_n_f32(0.0f);
+    float32x4_t s2 = vdupq_n_f32(0.0f);
+    float32x4_t s3 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = vmlaq_f32(s0, vld1q_f32(a + i), vld1q_f32(b + i));
+        s1 = vmlaq_f32(s1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        s2 = vmlaq_f32(s2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+        s3 = vmlaq_f32(s3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    float32x4_t acc = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
+    float s = vaddvq_f32(acc);
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+#endif
+}
+
+// y = x @ W^T.  W is [out, in].  Tile both the row and output dimensions so a
+// tile of W and a tile of x stay resident while they are reused; the old
+// per-row dot-product loop re-read the whole weight matrix for every token,
+// which is what made a 100M-parameter step take minutes on a phone.
+void matmul_nt_raw(const Tensor& x, const float* w, int out, Tensor& y) {
+    const int n = x.rows;
+    const int in = x.cols;
+    if (n <= 0 || out <= 0 || in <= 0) return;
+    y.ensure(n, out);
+    constexpr int kOutTile = 8;
+    constexpr int kRowTile = 16;
+    const int outTiles = (out + kOutTile - 1) / kOutTile;
+    const int rowTiles = (n + kRowTile - 1) / kRowTile;
+    const int64_t work = static_cast<int64_t>(n) * out * in;
+    auto body = [&](int tile) {
+        const int ob = tile / rowTiles;
+        const int rb = tile % rowTiles;
+        const int o0 = ob * kOutTile;
+        const int o1 = std::min(out, o0 + kOutTile);
+        const int r0 = rb * kRowTile;
+        const int r1 = std::min(n, r0 + kRowTile);
+        for (int o = o0; o < o1; ++o) {
+            const float* wr = w + static_cast<size_t>(o) * in;
+            for (int r = r0; r < r1; ++r) {
+                y.row(r)[o] = dot_f32(x.row(r), wr, in);
+            }
+        }
+    };
+    const int tiles = outTiles * rowTiles;
+    if (work < 300000) {
+        for (int t = 0; t < tiles; ++t) body(t);
+    } else {
+        parallel_for_any(tiles, body);
+    }
+}
+
+void add_bias(Tensor& y, const float* bias) {
+    for (int r = 0; r < y.rows; ++r) {
+        float* yr = y.row(r);
+        for (int c = 0; c < y.cols; ++c) yr[c] += bias[c];
+    }
+}
+
+inline float gelu_scalar(float x) {
+    const float u = kGeluC * (x + kGeluK * x * x * x);
+    return 0.5f * x * (1.0f + std::tanh(u));
+}
+
+inline float gelu_grad_scalar(float x) {
+    const float u = kGeluC * (x + kGeluK * x * x * x);
+    const float t = std::tanh(u);
+    const float du = kGeluC * (1.0f + 3.0f * kGeluK * x * x);
+    return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * du;
+}
+
+#if defined(__aarch64__)
+// dW[o][i] += sum_r dout[r][o] * x[r][i]
+//
+// The reduction axis is the batch, so the tile covers the output and input
+// axes: an 8x8 tile keeps 64 accumulators in vector registers and reads
+// every value of dout and x once per tile.  The previous version accumulated
+// into a scratch buffer for every single row, which spent most of the step
+// moving memory instead of multiplying.
+void matmul_dw_add(Param& p, const Tensor& dout, const Tensor& x) {
+    const int out = p.rows;
+    const int in = p.cols;
+    const int n = dout.rows;
+    if (out <= 0 || in <= 0 || n <= 0) return;
+    constexpr int kOutTile = 8;
+    constexpr int kInTile = 8;
+    const int outTiles = (out + kOutTile - 1) / kOutTile;
+    const int inTiles = (in + kInTile - 1) / kInTile;
+    auto body = [&](int tile) {
+        const int ot = tile / inTiles;
+        const int it = tile % inTiles;
+        const int o0 = ot * kOutTile;
+        const int i0 = it * kInTile;
+        const int nr = std::min(kOutTile, out - o0);
+        const int ni = std::min(kInTile, in - i0);
+        if (nr == kOutTile && ni == kInTile) {
+            float32x4_t lo[kOutTile];
+            float32x4_t hi[kOutTile];
+            for (int oi = 0; oi < kOutTile; ++oi) {
+                lo[oi] = vdupq_n_f32(0.0f);
+                hi[oi] = vdupq_n_f32(0.0f);
+            }
+            for (int r = 0; r < n; ++r) {
+                const float* dr = dout.row(r) + o0;
+                const float* xr = x.row(r) + i0;
+                const float32x4_t x0 = vld1q_f32(xr);
+                const float32x4_t x1 = vld1q_f32(xr + 4);
+                for (int oi = 0; oi < kOutTile; ++oi) {
+                    const float32x4_t g = vdupq_n_f32(dr[oi]);
+                    lo[oi] = vmlaq_f32(lo[oi], g, x0);
+                    hi[oi] = vmlaq_f32(hi[oi], g, x1);
+                }
+            }
+            for (int oi = 0; oi < kOutTile; ++oi) {
+                float* gp = p.g.data() + static_cast<size_t>(o0 + oi) * in + i0;
+                vst1q_f32(gp, vaddq_f32(vld1q_f32(gp), lo[oi]));
+                vst1q_f32(gp + 4, vaddq_f32(vld1q_f32(gp + 4), hi[oi]));
+            }
+            return;
+        }
+        // Edge tile: a plain scalar accumulation for the last few rows.
+        for (int r = 0; r < n; ++r) {
+            const float* dr = dout.row(r) + o0;
+            const float* xr = x.row(r) + i0;
+            for (int oi = 0; oi < nr; ++oi) {
+                const float g = dr[oi];
+                float* gp = p.g.data() + static_cast<size_t>(o0 + oi) * in + i0;
+                for (int ii = 0; ii < ni; ++ii) gp[ii] += g * xr[ii];
+            }
+        }
+    };
+    const int64_t work = static_cast<int64_t>(out) * in * n;
+    const int tiles = outTiles * inTiles;
+    if (work < 300000) {
+        for (int t = 0; t < tiles; ++t) body(t);
+    } else {
+        parallel_for_any(tiles, body);
+    }
+}
+
+// dX[r][i] += sum_o dout[r][o] * W[o][i]
+//
+// The reduction axis is the output axis, so the tile covers four rows of dX
+// and eight input columns.  The weight row is loaded once per tile instead of
+// once per row and the accumulators stay in vector registers.
+void matmul_dx_add(const Tensor& dout, const float* w, int out, int in, Tensor& din) {
+    const int n = dout.rows;
+    if (n <= 0 || out <= 0 || in <= 0) return;
+    constexpr int kRowTile = 4;
+    constexpr int kInTile = 8;
+    const int rowTiles = (n + kRowTile - 1) / kRowTile;
+    const int inTiles = (in + kInTile - 1) / kInTile;
+    auto body = [&](int tile) {
+        const int rt = tile / inTiles;
+        const int it = tile % inTiles;
+        const int r0 = rt * kRowTile;
+        const int i0 = it * kInTile;
+        const int nr = std::min(kRowTile, n - r0);
+        const int ni = std::min(kInTile, in - i0);
+        if (nr == kRowTile && ni == kInTile) {
+            float32x4_t lo[kRowTile];
+            float32x4_t hi[kRowTile];
+            for (int ri = 0; ri < kRowTile; ++ri) {
+                lo[ri] = vdupq_n_f32(0.0f);
+                hi[ri] = vdupq_n_f32(0.0f);
+            }
+            for (int o = 0; o < out; ++o) {
+                const float* wr = w + static_cast<size_t>(o) * in + i0;
+                const float32x4_t w0 = vld1q_f32(wr);
+                const float32x4_t w1 = vld1q_f32(wr + 4);
+                for (int ri = 0; ri < kRowTile; ++ri) {
+                    const float32x4_t g = vdupq_n_f32(dout.row(r0 + ri)[o]);
+                    lo[ri] = vmlaq_f32(lo[ri], g, w0);
+                    hi[ri] = vmlaq_f32(hi[ri], g, w1);
+                }
+            }
+            for (int ri = 0; ri < kRowTile; ++ri) {
+                float* di = din.row(r0 + ri) + i0;
+                vst1q_f32(di, vaddq_f32(vld1q_f32(di), lo[ri]));
+                vst1q_f32(di + 4, vaddq_f32(vld1q_f32(di + 4), hi[ri]));
+            }
+            return;
+        }
+        // Edge tile.
+        for (int o = 0; o < out; ++o) {
+            const float* wr = w + static_cast<size_t>(o) * in + i0;
+            for (int ri = 0; ri < nr; ++ri) {
+                const float g = dout.row(r0 + ri)[o];
+                float* di = din.row(r0 + ri) + i0;
+                for (int ii = 0; ii < ni; ++ii) di[ii] += g * wr[ii];
+            }
+        }
+    };
+    const int64_t work = static_cast<int64_t>(n) * out * in;
+    const int tiles = rowTiles * inTiles;
+    if (work < 300000) {
+        for (int t = 0; t < tiles; ++t) body(t);
+    } else {
+        parallel_for_any(tiles, body);
+    }
+}
+#else
+void matmul_dw_add(Param& p, const Tensor& dout, const Tensor& x) {
+    const int out = p.rows;
+    const int in = p.cols;
+    const int n = dout.rows;
+    if (out <= 0 || in <= 0 || n <= 0) return;
+    // dW += dout^T @ x.  Accumulate a small block of output rows so the inner
+    // loop stays contiguous over `in` (auto-vectorised) and each x row is
+    // reused for the whole output block.
+    constexpr int kOutBlock = 8;
+    const int blocks = (out + kOutBlock - 1) / kOutBlock;
+    auto body = [&](int block) {
+        const int o0 = block * kOutBlock;
+        const int w = std::min(kOutBlock, out - o0);
+        thread_local std::vector<float> acc;
+        acc.assign(static_cast<size_t>(w) * static_cast<size_t>(in), 0.0f);
+        for (int r = 0; r < n; ++r) {
+            const float* xr = x.row(r);
+            const float* dr = dout.row(r) + o0;
+            for (int j = 0; j < w; ++j) {
+                const float g = dr[j];
+                if (g == 0.0f) continue;
+                float* a = acc.data() + static_cast<size_t>(j) * in;
+                for (int i = 0; i < in; ++i) a[i] += g * xr[i];
+            }
+        }
+        for (int j = 0; j < w; ++j) {
+            float* gp = p.g.data() + static_cast<size_t>(o0 + j) * in;
+            const float* a = acc.data() + static_cast<size_t>(j) * in;
+            for (int i = 0; i < in; ++i) gp[i] += a[i];
+        }
+    };
+    const int64_t work = static_cast<int64_t>(out) * in * n;
+    if (work < 300000) {
+        for (int b = 0; b < blocks; ++b) body(b);
+    } else {
+        parallel_for_any(blocks, body);
+    }
+}
+
+void matmul_dx_add(const Tensor& dout, const float* w, int out, int in, Tensor& din) {
+    const int n = dout.rows;
+    if (n <= 0 || out <= 0 || in <= 0) return;
+    // dX += dout @ W.  Process a block of rows together so each weight row is
+    // loaded once per row block instead of once per row; the inner loop over
+    // `in` is contiguous and vectorises.
+    constexpr int kRowBlock = 8;
+    const int blocks = (n + kRowBlock - 1) / kRowBlock;
+    auto body = [&](int block) {
+        const int r0 = block * kRowBlock;
+        const int r1 = std::min(n, r0 + kRowBlock);
+        for (int o = 0; o < out; ++o) {
+            const float* wr = w + static_cast<size_t>(o) * in;
+            for (int r = r0; r < r1; ++r) {
+                const float g = dout.row(r)[o];
+                if (g == 0.0f) continue;
+                float* di = din.row(r);
+                for (int k = 0; k < in; ++k) di[k] += g * wr[k];
+            }
+        }
+    };
+    const int64_t work = static_cast<int64_t>(n) * out * in;
+    if (work < 300000) {
+        for (int b = 0; b < blocks; ++b) body(b);
+    } else {
+        parallel_for_any(blocks, body);
+    }
+}
+#endif
+
+void bias_grad_add(Param& b, const Tensor& dout) {
+    const int out = b.cols;
+    const int n = dout.rows;
+    if (out <= 0 || n <= 0) return;
+    // Sum the rows into a contiguous accumulator.  Reading one column at a
+    // time walked the whole gradient matrix with a stride and cost more than
+    // the multiplication it was supposed to accompany.
+    std::vector<float> acc(static_cast<size_t>(out), 0.0f);
+    for (int r = 0; r < n; ++r) {
+        const float* dr = dout.row(r);
+        for (int o = 0; o < out; ++o) acc[o] += dr[o];
+    }
+    for (int o = 0; o < out; ++o) b.g[o] += acc[o];
+}
+
+void layernorm_backward(const Tensor& x, Param& gamma, Param& beta,
+                        const Tensor& dy, Tensor& dx, const Tensor& inv) {
+    const int n = x.rows;
+    const int d = x.cols;
+    dx.ensure(n, d);
+    std::vector<float> dg(d, 0.0f);
+    std::vector<float> db(d, 0.0f);
+    for (int r = 0; r < n; ++r) {
+        const float* xr = x.row(r);
+        const float* dyr = dy.row(r);
+        float mean = 0.0f;
+        for (int j = 0; j < d; ++j) mean += xr[j];
+        mean /= d;
+        const float iv = inv.row(r)[0];
+        float m1 = 0.0f;
+        float m2 = 0.0f;
+        for (int j = 0; j < d; ++j) {
+            const float xhat = (xr[j] - mean) * iv;
+            const float g = gamma.w[j];
+            dg[j] += dyr[j] * xhat;
+            db[j] += dyr[j];
+            const float t = dyr[j] * g;
+            m1 += t;
+            m2 += t * xhat;
+        }
+        m1 /= d;
+        m2 /= d;
+        float* dxr = dx.row(r);
+        for (int j = 0; j < d; ++j) {
+            const float xhat = (xr[j] - mean) * iv;
+            dxr[j] = iv * (dyr[j] * gamma.w[j] - m1 - xhat * m2);
+        }
+    }
+    for (int j = 0; j < d; ++j) {
+        gamma.g[j] += dg[j];
+        beta.g[j] += db[j];
+    }
+}
+
+void attention_forward(const ModelConfig& cfg, LayerCache& lc, int B, int T) {
+    const int d = cfg.d_model;
+    const int H = cfg.heads;
+    const int hd = cfg.head_dim();
+    const int n = B * T;
+    const float inv_sqrt_hd = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    lc.attn_out.ensure(n, d);
+    lc.probs.ensure(B * H * T, T);
+
+    auto body = [&](int bh) {
+        const int b = bh / H;
+        const int h = bh % H;
+        for (int t = 0; t < T; ++t) {
+            const float* q = lc.q.row(b * T + t) + h * hd;
+            float* prow = lc.probs.row(bh * T + t);
+            float maxv = -1e30f;
+            for (int s = 0; s <= t; ++s) {
+                const float* k = lc.k.row(b * T + s) + h * hd;
+                const float sc = dot_f32(q, k, hd) * inv_sqrt_hd;
+                prow[s] = sc;
+                if (sc > maxv) maxv = sc;
+            }
+            float sum = 0.0f;
+            for (int s = 0; s <= t; ++s) {
+                const float e = std::exp(prow[s] - maxv);
+                prow[s] = e;
+                sum += e;
+            }
+            const float invsum = 1.0f / sum;
+            for (int s = 0; s <= t; ++s) prow[s] *= invsum;
+
+            float* out = lc.attn_out.row(b * T + t) + h * hd;
+            for (int j = 0; j < hd; ++j) out[j] = 0.0f;
+            for (int s = 0; s <= t; ++s) {
+                const float p = prow[s];
+                const float* v = lc.v.row(b * T + s) + h * hd;
+                for (int j = 0; j < hd; ++j) out[j] += p * v[j];
+            }
+        }
+    };
+
+    const int64_t work = static_cast<int64_t>(B) * H * T * T * hd;
+    if (work < 300000) {
+        for (int bh = 0; bh < B * H; ++bh) body(bh);
+    } else {
+        parallel_for_any(B * H, body);
+    }
+}
+
+void attention_backward(const ModelConfig& cfg, const LayerCache& lc,
+                        const Tensor& dattn, Tensor& dq, Tensor& dk, Tensor& dv,
+                        int B, int T) {
+    const int d = cfg.d_model;
+    const int H = cfg.heads;
+    const int hd = cfg.head_dim();
+    const int n = B * T;
+    const float inv_sqrt_hd = 1.0f / std::sqrt(static_cast<float>(hd));
+    dq.ensure(n, d);
+    dk.ensure(n, d);
+    dv.ensure(n, d);
+
+    auto body = [&](int bh) {
+        const int b = bh / H;
+        const int h = bh % H;
+        std::vector<float> dp(T);
+        for (int t = 0; t < T; ++t) {
+            const float* datt = dattn.row(b * T + t) + h * hd;
+            const float* prow = lc.probs.row(bh * T + t);
+            float dot = 0.0f;
+            for (int s = 0; s <= t; ++s) {
+                const float* v = lc.v.row(b * T + s) + h * hd;
+                float sdp = 0.0f;
+                for (int j = 0; j < hd; ++j) sdp += datt[j] * v[j];
+                dp[s] = sdp;
+                dot += prow[s] * sdp;
+            }
+            float* dqr = dq.row(b * T + t) + h * hd;
+            const float* q = lc.q.row(b * T + t) + h * hd;
+            for (int s = 0; s <= t; ++s) {
+                const float ds = prow[s] * (dp[s] - dot) * inv_sqrt_hd;
+                const float* k = lc.k.row(b * T + s) + h * hd;
+                float* dkr = dk.row(b * T + s) + h * hd;
+                float* dvr = dv.row(b * T + s) + h * hd;
+                const float p = prow[s];
+                for (int j = 0; j < hd; ++j) {
+                    dqr[j] += ds * k[j];
+                    dkr[j] += ds * q[j];
+                    dvr[j] += p * datt[j];
+                }
+            }
+        }
+    };
+
+    const int64_t work = static_cast<int64_t>(B) * H * T * T * hd * 2;
+    if (work < 300000) {
+        for (int bh = 0; bh < B * H; ++bh) body(bh);
+    } else {
+        parallel_for_any(B * H, body);
+    }
+}
+
+// Symmetric per-group fake quantization used by QAT (straight-through in backward).
+void fake_quant_into(const Param& src, Tensor& dst, int bits, int group) {
+    const int out = src.rows;
+    const int in = src.cols;
+    dst.init(out, in);
+    if (bits <= 0 || bits >= 32) {
+        std::copy(src.w.begin(), src.w.end(), dst.d.begin());
+        return;
+    }
+    const int qmax = (1 << (bits - 1)) - 1;
+    if (group <= 0) group = 32;
+    for (int r = 0; r < out; ++r) {
+        const float* wr = src.row(r);
+        float* dr = dst.row(r);
+        for (int g0 = 0; g0 < in; g0 += group) {
+            const int g1 = std::min(in, g0 + group);
+            float maxabs = 0.0f;
+            for (int j = g0; j < g1; ++j) maxabs = std::max(maxabs, std::fabs(wr[j]));
+            if (maxabs == 0.0f) {
+                for (int j = g0; j < g1; ++j) dr[j] = 0.0f;
+                continue;
+            }
+            const float scale = maxabs / static_cast<float>(qmax);
+            for (int j = g0; j < g1; ++j) {
+                float q = std::round(wr[j] / scale);
+                q = std::max(-static_cast<float>(qmax), std::min(static_cast<float>(qmax), q));
+                dr[j] = q * scale;
+            }
+        }
+    }
+}
+
+const float* lin_w(const Linear& lin) {
+    if (lin.qat_bits > 0 && !lin.fake_weight.d.empty()) return lin.fake_weight.data();
+    return lin.weight.data();
+}
+
+} // namespace
+
+void matmul_nt(const Tensor& x, const float* w, int out, Tensor& y) {
+    matmul_nt_raw(x, w, out, y);
+}
+
+void matmul_nt(const Tensor& x, const Tensor& w, Tensor& y) {
+    matmul_nt_raw(x, w.data(), w.rows, y);
+}
+
+void gelu_forward(const Tensor& in, Tensor& out) {
+    out.ensure(in.rows, in.cols);
+    for (size_t i = 0; i < in.d.size(); ++i) out.d[i] = gelu_scalar(in.d[i]);
+}
+
+void layernorm_forward(const Tensor& x, const float* gamma, const float* beta,
+                       Tensor& y, Tensor& inv, float eps) {
+    const int n = x.rows;
+    const int d = x.cols;
+    y.ensure(n, d);
+    inv.ensure(n, 1);
+    parallel_for(n, [&](int r) {
+        const float* xr = x.row(r);
+        float mean = 0.0f;
+        for (int j = 0; j < d; ++j) mean += xr[j];
+        mean /= d;
+        float var = 0.0f;
+        for (int j = 0; j < d; ++j) {
+            const float t = xr[j] - mean;
+            var += t * t;
+        }
+        var /= d;
+        const float iv = 1.0f / std::sqrt(var + eps);
+        inv.row(r)[0] = iv;
+        float* yr = y.row(r);
+        for (int j = 0; j < d; ++j) {
+            yr[j] = (xr[j] - mean) * iv * gamma[j] + beta[j];
+        }
+    });
+}
+
+double cross_entropy_loss(const Tensor& logits, const int* targets, Tensor& dlogits) {
+    const int n = logits.rows;
+    const int V = logits.cols;
+    dlogits.ensure(n, V);
+    if (n <= 0 || V <= 0 || targets == nullptr) return -1.0;
+    double total = 0.0;
+    const float invn = 1.0f / static_cast<float>(n);
+    for (int r = 0; r < n; ++r) {
+        const float* lr = logits.row(r);
+        float* dr = dlogits.row(r);
+        const int tgt = targets[r];
+        if (tgt < 0 || tgt >= V) {
+            // Should be unreachable: callers validate first. Report a large
+            // loss and a zero gradient instead of reading out of bounds.
+            total += 1e6;
+            continue;
+        }
+        float mx = -1e30f;
+        for (int v = 0; v < V; ++v) mx = std::max(mx, lr[v]);
+        float sum = 0.0f;
+        for (int v = 0; v < V; ++v) sum += std::exp(lr[v] - mx);
+        const float p = std::exp(lr[tgt] - mx) / sum;
+        total += -std::log(std::max(p, 1e-30f));
+        for (int v = 0; v < V; ++v) {
+            float prob = std::exp(lr[v] - mx) / sum;
+            dr[v] = (prob - (v == tgt ? 1.0f : 0.0f)) * invn;
+        }
+    }
+    return total / static_cast<double>(n);
+}
+
+// ---------------------------------------------------------------------------
+// GPT
+// ---------------------------------------------------------------------------
+
+bool GPT::init(const ModelConfig& cfg, uint64_t seed) {
+    if (!cfg.valid()) return false;
+    cfg_ = cfg;
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.02f);
+
+    wte_.init(cfg_.vocab, cfg_.d_model);
+    lnf_g_.init(1, cfg_.d_model, false);
+    lnf_b_.init(1, cfg_.d_model, false);
+
+    for (auto& x : wte_.w) x = normal(rng);
+    std::fill(lnf_g_.w.begin(), lnf_g_.w.end(), 1.0f);
+
+    const float residual_std = 0.02f / std::sqrt(2.0f * static_cast<float>(cfg_.layers));
+    layers_.assign(cfg_.layers, Layer{});
+    for (auto& layer : layers_) {
+        layer.ln1.gamma.init(1, cfg_.d_model, false);
+        layer.ln1.beta.init(1, cfg_.d_model, false);
+        layer.ln2.gamma.init(1, cfg_.d_model, false);
+        layer.ln2.beta.init(1, cfg_.d_model, false);
+        std::fill(layer.ln1.gamma.w.begin(), layer.ln1.gamma.w.end(), 1.0f);
+        std::fill(layer.ln2.gamma.w.begin(), layer.ln2.gamma.w.end(), 1.0f);
+
+        auto init_linear = [&](Linear& lin, int out, int in) {
+            lin.weight.init(out, in, true);
+            lin.bias.init(1, out, false);
+            for (auto& x : lin.weight.w) x = normal(rng);
+        };
+        init_linear(layer.wq, cfg_.d_model, cfg_.d_model);
+        init_linear(layer.wk, cfg_.d_model, cfg_.d_model);
+        init_linear(layer.wv, cfg_.d_model, cfg_.d_model);
+        init_linear(layer.wo, cfg_.d_model, cfg_.d_model);
+        init_linear(layer.w1, cfg_.d_ff, cfg_.d_model);
+        init_linear(layer.w2, cfg_.d_model, cfg_.d_ff);
+
+        for (auto* lin : {&layer.wo, &layer.w2}) {
+            const float scale = residual_std / 0.02f;
+            for (auto& x : lin->weight.w) x *= scale;
+        }
+        for (auto* lin : {&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w1, &layer.w2}) {
+            lin->qat_bits = 0;
+            lin->qat_group = 32;
+        }
+    }
+    qat_bits_ = 0;
+    qat_group_ = 32;
+    step_ = 0;
+    adam_step_ = 0;
+    cache_ = ForwardCache{};
+    return true;
+}
+
+std::vector<Param*> GPT::params() {
+    std::vector<Param*> out = {&wte_, &lnf_g_, &lnf_b_};
+    for (auto& l : layers_) {
+        out.push_back(&l.ln1.gamma);
+        out.push_back(&l.ln1.beta);
+        out.push_back(&l.ln2.gamma);
+        out.push_back(&l.ln2.beta);
+        out.push_back(&l.wq.weight);
+        out.push_back(&l.wq.bias);
+        out.push_back(&l.wk.weight);
+        out.push_back(&l.wk.bias);
+        out.push_back(&l.wv.weight);
+        out.push_back(&l.wv.bias);
+        out.push_back(&l.wo.weight);
+        out.push_back(&l.wo.bias);
+        out.push_back(&l.w1.weight);
+        out.push_back(&l.w1.bias);
+        out.push_back(&l.w2.weight);
+        out.push_back(&l.w2.bias);
+    }
+    return out;
+}
+
+std::vector<Linear*> GPT::linears() {
+    std::vector<Linear*> out;
+    for (auto& l : layers_) {
+        out.push_back(&l.wq);
+        out.push_back(&l.wk);
+        out.push_back(&l.wv);
+        out.push_back(&l.wo);
+        out.push_back(&l.w1);
+        out.push_back(&l.w2);
+    }
+    return out;
+}
+
+std::vector<const Linear*> GPT::linears() const {
+    std::vector<const Linear*> out;
+    for (const auto& l : layers_) {
+        out.push_back(&l.wq);
+        out.push_back(&l.wk);
+        out.push_back(&l.wv);
+        out.push_back(&l.wo);
+        out.push_back(&l.w1);
+        out.push_back(&l.w2);
+    }
+    return out;
+}
+
+void GPT::set_qat(int bits, int group) {
+    // QAT only makes sense for a real packed width. Anything else disables it
+    // instead of allocating a full float copy of every linear weight.
+    if (bits < 2 || bits >= 32) bits = 0;
+    if (group <= 0) group = 32;
+    qat_bits_ = bits;
+    qat_group_ = group;
+    for (auto* lin : linears()) {
+        lin->qat_bits = bits;
+        lin->qat_group = group;
+        if (bits > 0) {
+            fake_quant_into(lin->weight, lin->fake_weight, bits, group);
+        } else {
+            lin->fake_weight = Tensor{};
+        }
+    }
+}
+
+void GPT::zero_grads() {
+    for (auto* p : params()) std::fill(p->g.begin(), p->g.end(), 0.0f);
+}
+
+void GPT::forward_logits(const int* tokens, int B, int T) {
+    const int d = cfg_.d_model;
+    const int V = cfg_.vocab;
+    const int n = B * T;
+    const int df = cfg_.d_ff;
+
+    for (auto* lin : linears()) {
+        if (lin->qat_bits > 0) {
+            fake_quant_into(lin->weight, lin->fake_weight, lin->qat_bits, lin->qat_group);
+        }
+    }
+
+    cache_.B = B;
+    cache_.T = T;
+    cache_.tokens.assign(tokens, tokens + n);
+    cache_.layers.resize(cfg_.layers);
+
+    Tensor cur(n, d);
+    for (int i = 0; i < n; ++i) {
+        const int tok = tokens[i];
+        const int pos = i % T;
+        const float* te = wte_.row(tok);
+        float* xr = cur.row(i);
+        for (int j = 0; j < d; ++j) xr[j] = te[j];
+        add_positional(pos, d, xr);
+    }
+    cache_.x0 = cur;
+
+    for (int l = 0; l < cfg_.layers; ++l) {
+        if (stop_requested()) {
+            aborted_ = true;
+            return;
+        }
+        Layer& layer = layers_[l];
+        LayerCache& lc = cache_.layers[l];
+
+        lc.xin = cur;
+        layernorm_forward(cur, layer.ln1.gamma.w.data(), layer.ln1.beta.w.data(),
+                          lc.ln1, lc.inv1, kLnEps);
+
+        matmul_nt_raw(lc.ln1, lin_w(layer.wq), d, lc.q);
+        add_bias(lc.q, layer.wq.bias.w.data());
+        matmul_nt_raw(lc.ln1, lin_w(layer.wk), d, lc.k);
+        add_bias(lc.k, layer.wk.bias.w.data());
+        matmul_nt_raw(lc.ln1, lin_w(layer.wv), d, lc.v);
+        add_bias(lc.v, layer.wv.bias.w.data());
+
+        attention_forward(cfg_, lc, B, T);
+
+        matmul_nt_raw(lc.attn_out, lin_w(layer.wo), d, lc.proj);
+        add_bias(lc.proj, layer.wo.bias.w.data());
+        lc.xmid.ensure(n, d);
+        for (int i = 0; i < n; ++i) {
+            const float* a = cur.row(i);
+            const float* b = lc.proj.row(i);
+            float* o = lc.xmid.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+
+        layernorm_forward(lc.xmid, layer.ln2.gamma.w.data(), layer.ln2.beta.w.data(),
+                          lc.ln2, lc.inv2, kLnEps);
+
+        matmul_nt_raw(lc.ln2, lin_w(layer.w1), df, lc.h1pre);
+        add_bias(lc.h1pre, layer.w1.bias.w.data());
+        gelu_forward(lc.h1pre, lc.h1);
+
+        matmul_nt_raw(lc.h1, lin_w(layer.w2), d, lc.h2);
+        add_bias(lc.h2, layer.w2.bias.w.data());
+
+        Tensor next(n, d);
+        for (int i = 0; i < n; ++i) {
+            const float* a = lc.xmid.row(i);
+            const float* b = lc.h2.row(i);
+            float* o = next.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+        cur = std::move(next);
+    }
+
+    cache_.final_in = cur;
+    if (stop_requested()) {
+        aborted_ = true;
+        return;
+    }
+    layernorm_forward(cur, lnf_g_.w.data(), lnf_b_.w.data(), cache_.lnf, cache_.invf, kLnEps);
+    matmul_nt_raw(cache_.lnf, wte_.data(), V, cache_.logits);
+}
+
+float GPT::forward(const int* tokens, const int* targets, int B, int T) {
+    const int64_t count = static_cast<int64_t>(B) * static_cast<int64_t>(T);
+    if (!cfg_.valid() || B <= 0 || T <= 0 || T > cfg_.context ||
+        count <= 0 || count > (int64_t{1} << 24)) {
+        cache_ = ForwardCache{};
+        return -1.0f;
+    }
+    const int n = static_cast<int>(count);
+    if (!tokens_in_range(tokens, n, cfg_.vocab) ||
+        (targets != nullptr && !targets_in_range(targets, n, cfg_.vocab))) {
+        cache_ = ForwardCache{};
+        return -1.0f;
+    }
+    aborted_ = false;
+    forward_logits(tokens, B, T);
+    if (aborted_ || stop_requested()) {
+        aborted_ = true;
+        cache_ = ForwardCache{};
+        return kStopped;
+    }
+    // Inference-only forwards must not leave a stale dlogits buffer behind for
+    // an explicit backward() call to consume.
+    if (targets == nullptr) {
+        cache_.dlogits = Tensor{};
+        return 0.0f;
+    }
+    const double loss = cross_entropy_loss(cache_.logits, targets, cache_.dlogits);
+    return std::isfinite(loss) ? static_cast<float>(loss) : -1.0f;
+}
+
+void GPT::backward() {
+    if (cache_.logits.d.empty() || cache_.dlogits.d.empty()) return;
+    if (cache_.dlogits.rows != cache_.logits.rows ||
+        cache_.dlogits.cols != cache_.logits.cols) {
+        return;
+    }
+    aborted_ = false;
+    if (stop_requested()) {
+        aborted_ = true;
+        return;
+    }
+    const int d = cfg_.d_model;
+    const int df = cfg_.d_ff;
+    const int V = cfg_.vocab;
+    const int B = cache_.B;
+    const int T = cache_.T;
+    const int n = B * T;
+
+    Tensor dcur(n, d);
+
+    // Tied output head: logits = lnf @ wte^T
+    Tensor dlnf(n, d);
+    matmul_dx_add(cache_.dlogits, wte_.data(), V, d, dlnf);
+    matmul_dw_add(wte_, cache_.dlogits, cache_.lnf);
+    layernorm_backward(cache_.final_in, lnf_g_, lnf_b_, dlnf, dcur, cache_.invf);
+
+    for (int l = cfg_.layers - 1; l >= 0; --l) {
+        if (stop_requested()) {
+            aborted_ = true;
+            return;
+        }
+        Layer& layer = layers_[l];
+        LayerCache& lc = cache_.layers[l];
+
+        // MLP: xout = xmid + h2
+        matmul_dw_add(layer.w2.weight, dcur, lc.h1);
+        bias_grad_add(layer.w2.bias, dcur);
+        Tensor dh1(n, df);
+        matmul_dx_add(dcur, lin_w(layer.w2), d, df, dh1);
+        Tensor dh1pre(n, df);
+        for (int i = 0; i < n; ++i) {
+            const float* a = dh1.row(i);
+            const float* pre = lc.h1pre.row(i);
+            float* o = dh1pre.row(i);
+            for (int j = 0; j < df; ++j) o[j] = a[j] * gelu_grad_scalar(pre[j]);
+        }
+        matmul_dw_add(layer.w1.weight, dh1pre, lc.ln2);
+        bias_grad_add(layer.w1.bias, dh1pre);
+        Tensor dln2(n, d);
+        matmul_dx_add(dh1pre, lin_w(layer.w1), df, d, dln2);
+        Tensor dxmid_ln(n, d);
+        layernorm_backward(lc.xmid, layer.ln2.gamma, layer.ln2.beta,
+                           dln2, dxmid_ln, lc.inv2);
+
+        Tensor dxmid(n, d);
+        for (int i = 0; i < n; ++i) {
+            const float* a = dcur.row(i);
+            const float* b = dxmid_ln.row(i);
+            float* o = dxmid.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+
+        // Attention block: xmid = xin + proj
+        matmul_dw_add(layer.wo.weight, dxmid, lc.attn_out);
+        bias_grad_add(layer.wo.bias, dxmid);
+        Tensor dattn(n, d);
+        matmul_dx_add(dxmid, lin_w(layer.wo), d, d, dattn);
+
+        Tensor dq(n, d), dk(n, d), dv(n, d);
+        attention_backward(cfg_, lc, dattn, dq, dk, dv, B, T);
+
+        matmul_dw_add(layer.wq.weight, dq, lc.ln1);
+        bias_grad_add(layer.wq.bias, dq);
+        matmul_dw_add(layer.wk.weight, dk, lc.ln1);
+        bias_grad_add(layer.wk.bias, dk);
+        matmul_dw_add(layer.wv.weight, dv, lc.ln1);
+        bias_grad_add(layer.wv.bias, dv);
+
+        Tensor dln1(n, d);
+        matmul_dx_add(dq, lin_w(layer.wq), d, d, dln1);
+        matmul_dx_add(dk, lin_w(layer.wk), d, d, dln1);
+        matmul_dx_add(dv, lin_w(layer.wv), d, d, dln1);
+
+        Tensor dxin_ln(n, d);
+        layernorm_backward(lc.xin, layer.ln1.gamma, layer.ln1.beta,
+                           dln1, dxin_ln, lc.inv1);
+
+        for (int i = 0; i < n; ++i) {
+            const float* a = dxmid.row(i);
+            const float* b = dxin_ln.row(i);
+            float* o = dcur.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+    }
+
+    // Embedding gradients (weight tying: wte also received the head gradient).
+    for (int i = 0; i < n; ++i) {
+        const int tok = cache_.tokens[i];
+        const float* dc = dcur.row(i);
+        float* gte = wte_.g.data() + static_cast<size_t>(tok) * d;
+        for (int j = 0; j < d; ++j) gte[j] += dc[j];
+    }
+}
+
+void GPT::adam_update(float lr, float weight_decay) {
+    ++step_;
+    ++adam_step_;
+    const float b1 = 0.9f;
+    const float b2 = 0.999f;
+    const float eps = 1e-8f;
+    const double bc1 = 1.0 - std::pow(static_cast<double>(b1), static_cast<double>(adam_step_));
+    const double bc2 = 1.0 - std::pow(static_cast<double>(b2), static_cast<double>(adam_step_));
+    const float inv_bc1 = static_cast<float>(1.0 / bc1);
+    const float inv_bc2 = static_cast<float>(1.0 / bc2);
+
+    for (auto* p : params()) {
+        const size_t count = p->w.size();
+        float* w = p->w.data();
+        const float* g = p->g.data();
+        float* m = p->m.data();
+        float* v = p->v.data();
+        const float wd = p->weight_decay ? weight_decay : 0.0f;
+        for (size_t i = 0; i < count; ++i) {
+            m[i] = b1 * m[i] + (1.0f - b1) * g[i];
+            v[i] = b2 * v[i] + (1.0f - b2) * g[i] * g[i];
+            const float mh = m[i] * inv_bc1;
+            const float vh = v[i] * inv_bc2;
+            w[i] -= lr * (mh / (std::sqrt(vh) + eps) + wd * w[i]);
+        }
+    }
+}
+
+float GPT::train_step(const int* tokens, const int* targets, int B, int T,
+                      float lr, float weight_decay) {
+    const int64_t count = static_cast<int64_t>(B) * static_cast<int64_t>(T);
+    if (targets == nullptr || B <= 0 || T <= 0 || T > cfg_.context ||
+        count <= 0 || !tokens_in_range(tokens, static_cast<int>(count), cfg_.vocab) ||
+        !targets_in_range(targets, static_cast<int>(count), cfg_.vocab)) {
+        cache_ = ForwardCache{};
+        return -1.0f;
+    }
+    if (stop_requested()) return kStopped;
+    zero_grads();
+    const float loss = forward(tokens, targets, B, T);
+    if (aborted_ || stop_requested()) {
+        cache_ = ForwardCache{};
+        zero_grads();
+        aborted_ = true;
+        return kStopped;
+    }
+    if (!(loss >= 0.0f) || !std::isfinite(loss)) {
+        // A rejected batch must never apply gradients from the previous step.
+        cache_ = ForwardCache{};
+        zero_grads();
+        return -1.0f;
+    }
+    backward();
+    if (aborted_ || stop_requested()) {
+        // Gradients were only partially accumulated and AdamW has not run, so
+        // the weights are still exactly the previous step's weights.
+        cache_ = ForwardCache{};
+        zero_grads();
+        aborted_ = true;
+        return kStopped;
+    }
+    adam_update(lr, weight_decay);
+    zero_grads();
+    aborted_ = false;
+    return loss;
+}
+
+std::vector<int> GPT::generate(const std::vector<int>& prompt, int max_new,
+                               float temperature, int top_k, float top_p,
+                               uint64_t seed) {
+    std::vector<int> seq = prompt;
+    if (seq.empty()) seq.push_back(0);
+    if (max_new <= 0) return {};
+    const int V = cfg_.vocab;
+    std::mt19937_64 rng(seed);
+    std::vector<int> generated;
+    generated.reserve(max_new);
+
+    for (int step = 0; step < max_new; ++step) {
+        const int start = std::max(0, static_cast<int>(seq.size()) - cfg_.context);
+        const int T = static_cast<int>(seq.size()) - start;
+        forward(seq.data() + start, nullptr, 1, T);
+        const float* logits = cache_.logits.row(T - 1);
+
+        int next = 0;
+        if (temperature <= 0.0f) {
+            next = static_cast<int>(std::max_element(logits, logits + V) - logits);
+        } else {
+            std::vector<int> idx(V);
+            for (int i = 0; i < V; ++i) idx[i] = i;
+            std::vector<float> scaled(V);
+            for (int i = 0; i < V; ++i) scaled[i] = logits[i] / std::max(1e-5f, temperature);
+
+            int keep = V;
+            if (top_k > 0 && top_k < V) {
+                keep = top_k;
+                std::partial_sort(idx.begin(), idx.begin() + keep, idx.end(),
+                                  [&](int a, int b) { return scaled[a] > scaled[b]; });
+            } else {
+                std::sort(idx.begin(), idx.end(),
+                          [&](int a, int b) { return scaled[a] > scaled[b]; });
+            }
+
+            std::vector<float> probs(keep);
+            float mx = -1e30f;
+            for (int i = 0; i < keep; ++i) mx = std::max(mx, scaled[idx[i]]);
+            float sum = 0.0f;
+            for (int i = 0; i < keep; ++i) {
+                probs[i] = std::exp(scaled[idx[i]] - mx);
+                sum += probs[i];
+            }
+            for (int i = 0; i < keep; ++i) probs[i] /= sum;
+
+            int cutoff = keep;
+            if (top_p > 0.0f && top_p < 1.0f) {
+                float cumulative = 0.0f;
+                for (int i = 0; i < keep; ++i) {
+                    cumulative += probs[i];
+                    if (cumulative >= top_p) {
+                        cutoff = i + 1;
+                        break;
+                    }
+                }
+            }
+            float renorm = 0.0f;
+            for (int i = 0; i < cutoff; ++i) renorm += probs[i];
+            std::uniform_real_distribution<float> uni(0.0f, renorm);
+            const float target = uni(rng);
+            float acc = 0.0f;
+            next = idx[cutoff - 1];
+            for (int i = 0; i < cutoff; ++i) {
+                acc += probs[i];
+                if (target <= acc) {
+                    next = idx[i];
+                    break;
+                }
+            }
+        }
+        seq.push_back(next);
+        generated.push_back(next);
+    }
+    return generated;
+}
+
+namespace {
+
+bool write_param(FILE* f, const Param& p, bool with_optimizer) {
+    const int32_t rows = p.rows;
+    const int32_t cols = p.cols;
+    if (std::fwrite(&rows, sizeof(rows), 1, f) != 1) return false;
+    if (std::fwrite(&cols, sizeof(cols), 1, f) != 1) return false;
+    if (!p.w.empty() && std::fwrite(p.w.data(), sizeof(float), p.w.size(), f) != p.w.size()) {
+        return false;
+    }
+    if (with_optimizer) {
+        if (!p.m.empty() && std::fwrite(p.m.data(), sizeof(float), p.m.size(), f) != p.m.size()) {
+            return false;
+        }
+        if (!p.v.empty() && std::fwrite(p.v.data(), sizeof(float), p.v.size(), f) != p.v.size()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool skip_floats(FILE* f, size_t count) {
+    if (count == 0) return true;
+    return std::fseek(f, static_cast<long>(count * sizeof(float)), SEEK_CUR) == 0;
+}
+
+// Reads a parameter header and skips its payload. Used to load legacy
+// checkpoints written before positions became fixed sinusoidal values.
+bool skip_param(FILE* f, int32_t expect_rows, int32_t expect_cols, bool file_has_optimizer) {
+    int32_t rows = 0;
+    int32_t cols = 0;
+    if (std::fread(&rows, sizeof(rows), 1, f) != 1) return false;
+    if (std::fread(&cols, sizeof(cols), 1, f) != 1) return false;
+    if (rows != expect_rows || cols != expect_cols) return false;
+    const size_t count = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    return skip_floats(f, count * (file_has_optimizer ? 3u : 1u));
+}
+
+bool read_param(FILE* f, Param& p, bool file_has_optimizer, bool load_optimizer) {
+    int32_t rows = 0;
+    int32_t cols = 0;
+    if (std::fread(&rows, sizeof(rows), 1, f) != 1) return false;
+    if (std::fread(&cols, sizeof(cols), 1, f) != 1) return false;
+    if (rows != p.rows || cols != p.cols) return false;
+    if (!p.w.empty() && std::fread(p.w.data(), sizeof(float), p.w.size(), f) != p.w.size()) {
+        return false;
+    }
+    if (file_has_optimizer) {
+        if (load_optimizer) {
+            if (!p.m.empty() && std::fread(p.m.data(), sizeof(float), p.m.size(), f) != p.m.size()) {
+                return false;
+            }
+            if (!p.v.empty() && std::fread(p.v.data(), sizeof(float), p.v.size(), f) != p.v.size()) {
+                return false;
+            }
+        } else {
+            std::vector<float> scratch(p.w.size());
+            if (!scratch.empty() &&
+                std::fread(scratch.data(), sizeof(float), scratch.size(), f) != scratch.size()) {
+                return false;
+            }
+            if (!scratch.empty() &&
+                std::fread(scratch.data(), sizeof(float), scratch.size(), f) != scratch.size()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool GPT::save_checkpoint(const std::string& path, bool with_optimizer) const {
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+
+    int32_t magic = 0x4D46434B;  // "MFCK"
+    int32_t version = 2;         // v2 uses fixed sinusoidal positions
+    int32_t vocab = cfg_.vocab;
+    int32_t context = cfg_.context;
+    int32_t d_model = cfg_.d_model;
+    int32_t layers = cfg_.layers;
+    int32_t heads = cfg_.heads;
+    int32_t d_ff = cfg_.d_ff;
+    int32_t tied = cfg_.tied_embeddings ? 1 : 0;
+    int64_t step = step_;
+    int32_t has_opt = with_optimizer ? 1 : 0;
+    int32_t qat_bits = qat_bits_;
+    int32_t qat_group = qat_group_;
+    int64_t param_count = cfg_.param_count();
+
+    bool ok = true;
+    ok &= std::fwrite(&magic, sizeof(magic), 1, f) == 1;
+    ok &= std::fwrite(&version, sizeof(version), 1, f) == 1;
+    ok &= std::fwrite(&vocab, sizeof(vocab), 1, f) == 1;
+    ok &= std::fwrite(&context, sizeof(context), 1, f) == 1;
+    ok &= std::fwrite(&d_model, sizeof(d_model), 1, f) == 1;
+    ok &= std::fwrite(&layers, sizeof(layers), 1, f) == 1;
+    ok &= std::fwrite(&heads, sizeof(heads), 1, f) == 1;
+    ok &= std::fwrite(&d_ff, sizeof(d_ff), 1, f) == 1;
+    ok &= std::fwrite(&tied, sizeof(tied), 1, f) == 1;
+    ok &= std::fwrite(&step, sizeof(step), 1, f) == 1;
+    ok &= std::fwrite(&has_opt, sizeof(has_opt), 1, f) == 1;
+    ok &= std::fwrite(&qat_bits, sizeof(qat_bits), 1, f) == 1;
+    ok &= std::fwrite(&qat_group, sizeof(qat_group), 1, f) == 1;
+    ok &= std::fwrite(&param_count, sizeof(param_count), 1, f) == 1;
+
+    ok &= write_param(f, wte_, with_optimizer);
+    ok &= write_param(f, lnf_g_, with_optimizer);
+    ok &= write_param(f, lnf_b_, with_optimizer);
+    for (const auto& l : layers_) {
+        ok &= write_param(f, l.ln1.gamma, with_optimizer);
+        ok &= write_param(f, l.ln1.beta, with_optimizer);
+        ok &= write_param(f, l.ln2.gamma, with_optimizer);
+        ok &= write_param(f, l.ln2.beta, with_optimizer);
+        ok &= write_param(f, l.wq.weight, with_optimizer);
+        ok &= write_param(f, l.wq.bias, with_optimizer);
+        ok &= write_param(f, l.wk.weight, with_optimizer);
+        ok &= write_param(f, l.wk.bias, with_optimizer);
+        ok &= write_param(f, l.wv.weight, with_optimizer);
+        ok &= write_param(f, l.wv.bias, with_optimizer);
+        ok &= write_param(f, l.wo.weight, with_optimizer);
+        ok &= write_param(f, l.wo.bias, with_optimizer);
+        ok &= write_param(f, l.w1.weight, with_optimizer);
+        ok &= write_param(f, l.w1.bias, with_optimizer);
+        ok &= write_param(f, l.w2.weight, with_optimizer);
+        ok &= write_param(f, l.w2.bias, with_optimizer);
+    }
+    std::fclose(f);
+    if (!ok) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool GPT::load_checkpoint(const std::string& path, bool with_optimizer) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    int32_t magic = 0, version = 0;
+    int32_t vocab = 0, context = 0, d_model = 0, layers = 0, heads = 0, d_ff = 0, tied = 0;
+    int64_t step = 0;
+    int32_t has_opt = 0, qat_bits = 0, qat_group = 32;
+    int64_t param_count = 0;
+
+    bool ok = true;
+    ok &= std::fread(&magic, sizeof(magic), 1, f) == 1;
+    ok &= std::fread(&version, sizeof(version), 1, f) == 1;
+    ok &= std::fread(&vocab, sizeof(vocab), 1, f) == 1;
+    ok &= std::fread(&context, sizeof(context), 1, f) == 1;
+    ok &= std::fread(&d_model, sizeof(d_model), 1, f) == 1;
+    ok &= std::fread(&layers, sizeof(layers), 1, f) == 1;
+    ok &= std::fread(&heads, sizeof(heads), 1, f) == 1;
+    ok &= std::fread(&d_ff, sizeof(d_ff), 1, f) == 1;
+    ok &= std::fread(&tied, sizeof(tied), 1, f) == 1;
+    ok &= std::fread(&step, sizeof(step), 1, f) == 1;
+    ok &= std::fread(&has_opt, sizeof(has_opt), 1, f) == 1;
+    ok &= std::fread(&qat_bits, sizeof(qat_bits), 1, f) == 1;
+    ok &= std::fread(&qat_group, sizeof(qat_group), 1, f) == 1;
+    ok &= std::fread(&param_count, sizeof(param_count), 1, f) == 1;
+
+    if (!ok || magic != 0x4D46434B || (version != 1 && version != 2)) {
+        std::fclose(f);
+        return false;
+    }
+
+    ModelConfig cfg;
+    cfg.vocab = vocab;
+    cfg.context = context;
+    cfg.d_model = d_model;
+    cfg.layers = layers;
+    cfg.heads = heads;
+    cfg.d_ff = d_ff;
+    cfg.tied_embeddings = tied != 0;
+    const int64_t legacy_positions =
+        version == 1 ? static_cast<int64_t>(context) * d_model : 0;
+    if (!cfg.valid() || cfg.param_count() + legacy_positions != param_count) {
+        std::fclose(f);
+        return false;
+    }
+    if (!init(cfg, 1)) {
+        std::fclose(f);
+        return false;
+    }
+
+    const bool file_has_opt = has_opt != 0;
+    const bool load_opt = with_optimizer && file_has_opt;
+    ok &= read_param(f, wte_, file_has_opt, load_opt);
+    if (version == 1) {
+        ok &= skip_param(f, context, d_model, file_has_opt);
+    }
+    ok &= read_param(f, lnf_g_, file_has_opt, load_opt);
+    ok &= read_param(f, lnf_b_, file_has_opt, load_opt);
+    for (auto& l : layers_) {
+        ok &= read_param(f, l.ln1.gamma, file_has_opt, load_opt);
+        ok &= read_param(f, l.ln1.beta, file_has_opt, load_opt);
+        ok &= read_param(f, l.ln2.gamma, file_has_opt, load_opt);
+        ok &= read_param(f, l.ln2.beta, file_has_opt, load_opt);
+        ok &= read_param(f, l.wq.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.wq.bias, file_has_opt, load_opt);
+        ok &= read_param(f, l.wk.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.wk.bias, file_has_opt, load_opt);
+        ok &= read_param(f, l.wv.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.wv.bias, file_has_opt, load_opt);
+        ok &= read_param(f, l.wo.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.wo.bias, file_has_opt, load_opt);
+        ok &= read_param(f, l.w1.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.w1.bias, file_has_opt, load_opt);
+        ok &= read_param(f, l.w2.weight, file_has_opt, load_opt);
+        ok &= read_param(f, l.w2.bias, file_has_opt, load_opt);
+    }
+    std::fclose(f);
+    if (!ok) return false;
+
+    step_ = step;
+    // With optimizer state loaded, the moments match step; a weights-only
+    // recovery file has zero moments, so bias correction must start at zero
+    // instead of pretending hundreds of updates were applied.
+    adam_step_ = load_opt ? step : 0;
+    set_qat(qat_bits, qat_group);
+    return true;
+}
+
+namespace {
+
+constexpr int32_t kPackedMagic = 0x4D46504B;  // "MFPK"
+constexpr int32_t kPackedVersion = 2;  // v2 omits the learned position table
+
+bool packed_bits_ok(int bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 8;
+}
+
+int normalized_group(int group) {
+    return group > 0 ? group : 32;
+}
+
+bool write_floats(FILE* f, const float* data, size_t count) {
+    return count == 0 || std::fwrite(data, sizeof(float), count, f) == count;
+}
+
+bool read_floats(FILE* f, float* data, size_t count) {
+    return count == 0 || std::fread(data, sizeof(float), count, f) == count;
+}
+
+bool write_bytes(FILE* f, const std::vector<uint8_t>& data) {
+    return data.empty() || std::fwrite(data.data(), 1, data.size(), f) == data.size();
+}
+
+bool read_bytes(FILE* f, std::vector<uint8_t>& data) {
+    return data.empty() || std::fread(data.data(), 1, data.size(), f) == data.size();
+}
+
+void write_bits(std::vector<uint8_t>& data, size_t bitpos, int bits, uint32_t value) {
+    const size_t byte = bitpos >> 3;
+    const int offset = static_cast<int>(bitpos & 7);
+    const uint32_t mask = (1u << bits) - 1u;
+    const uint32_t v = value & mask;
+    data[byte] |= static_cast<uint8_t>((v << offset) & 0xFFu);
+    if (offset + bits > 8) {
+        data[byte + 1] |= static_cast<uint8_t>(v >> (8 - offset));
+    }
+}
+
+inline int read_bits(const uint8_t* data, size_t bitpos, int bits) {
+    const size_t byte = bitpos >> 3;
+    const int offset = static_cast<int>(bitpos & 7);
+    uint32_t v = data[byte];
+    if (offset + bits > 8) v |= static_cast<uint32_t>(data[byte + 1]) << 8;
+    v = (v >> offset) & ((1u << bits) - 1u);
+    const int sign = 1 << (bits - 1);
+    return static_cast<int>(v ^ static_cast<uint32_t>(sign)) - sign;
+}
+
+void quantize_into(const float* w, int out, int in, int bits, int group,
+                   std::vector<uint8_t>& packed, std::vector<float>& scales) {
+    const int gs = normalized_group(group);
+    const int groups = (in + gs - 1) / gs;
+    const int qmax = (1 << (bits - 1)) - 1;
+    const size_t total = static_cast<size_t>(out) * static_cast<size_t>(in);
+    packed.assign((total * static_cast<size_t>(bits) + 7) / 8, 0);
+    scales.assign(static_cast<size_t>(out) * static_cast<size_t>(groups), 0.0f);
+
+    for (int r = 0; r < out; ++r) {
+        const float* wr = w + static_cast<size_t>(r) * in;
+        for (int g = 0; g < groups; ++g) {
+            const int j0 = g * gs;
+            const int j1 = std::min(in, j0 + gs);
+            float maxabs = 0.0f;
+            for (int j = j0; j < j1; ++j) maxabs = std::max(maxabs, std::fabs(wr[j]));
+            if (maxabs == 0.0f) continue;
+            const float scale = maxabs / static_cast<float>(qmax);
+            scales[static_cast<size_t>(r) * groups + g] = scale;
+            for (int j = j0; j < j1; ++j) {
+                float q = std::round(wr[j] / scale);
+                q = std::max(-static_cast<float>(qmax), std::min(static_cast<float>(qmax), q));
+                const uint32_t u = static_cast<uint32_t>(static_cast<int32_t>(q)) &
+                                   ((1u << bits) - 1u);
+                write_bits(packed, (static_cast<size_t>(r) * in + j) * bits, bits, u);
+            }
+        }
+    }
+}
+
+void matmul_packed(const Tensor& x, const PackedLinear& lin, Tensor& y) {
+    const int n = x.rows;
+    const int in = lin.in;
+    const int out = lin.out;
+    y.ensure(n, out);
+    if (in <= 0 || out <= 0 || x.cols != in) {
+        std::fill(y.d.begin(), y.d.end(), 0.0f);
+        return;
+    }
+    const int bits = lin.bits;
+    const int gs = normalized_group(lin.group);
+    const int groups = lin.groups();
+    const uint8_t* packed = lin.q.data();
+
+    auto body = [&](int r) {
+        const float* xr = x.row(r);
+        float* yr = y.row(r);
+        for (int o = 0; o < out; ++o) {
+            size_t bitpos = static_cast<size_t>(o) * in * bits;
+            float sum = 0.0f;
+            for (int g = 0; g < groups; ++g) {
+                const int j0 = g * gs;
+                const int j1 = std::min(in, j0 + gs);
+                float part = 0.0f;
+                for (int j = j0; j < j1; ++j) {
+                    part += xr[j] * static_cast<float>(read_bits(packed, bitpos, bits));
+                    bitpos += bits;
+                }
+                sum += part * lin.scales[static_cast<size_t>(o) * groups + g];
+            }
+            yr[o] = sum + lin.bias[o];
+        }
+    };
+
+    const int64_t work = static_cast<int64_t>(n) * out * in;
+    if (work < 300000) {
+        for (int r = 0; r < n; ++r) body(r);
+    } else {
+        parallel_for(n, body);
+    }
+}
+
+} // namespace
+
+bool GPT::save_packed(const std::string& path, int bits, int group) const {
+    if (!packed_bits_ok(bits)) return false;
+    const int gs = normalized_group(group);
+
+    size_t total_packed = 0;
+    size_t total_scales = 0;
+    for (const auto* lin : linears()) {
+        const int groups = (lin->in() + gs - 1) / gs;
+        total_packed += (static_cast<size_t>(lin->out()) * lin->in() * bits + 7) / 8;
+        total_scales += static_cast<size_t>(lin->out()) * groups;
+    }
+
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+
+    int32_t magic = kPackedMagic;
+    int32_t version = kPackedVersion;
+    int32_t vocab = cfg_.vocab;
+    int32_t context = cfg_.context;
+    int32_t d_model = cfg_.d_model;
+    int32_t layers = cfg_.layers;
+    int32_t heads = cfg_.heads;
+    int32_t d_ff = cfg_.d_ff;
+    int32_t tied = cfg_.tied_embeddings ? 1 : 0;
+    int32_t out_bits = bits;
+    int32_t out_group = gs;
+    int64_t param_count = cfg_.param_count();
+    int64_t packed_bytes = static_cast<int64_t>(total_packed);
+    int64_t scale_count = static_cast<int64_t>(total_scales);
+
+    bool ok = true;
+    ok &= std::fwrite(&magic, sizeof(magic), 1, f) == 1;
+    ok &= std::fwrite(&version, sizeof(version), 1, f) == 1;
+    ok &= std::fwrite(&vocab, sizeof(vocab), 1, f) == 1;
+    ok &= std::fwrite(&context, sizeof(context), 1, f) == 1;
+    ok &= std::fwrite(&d_model, sizeof(d_model), 1, f) == 1;
+    ok &= std::fwrite(&layers, sizeof(layers), 1, f) == 1;
+    ok &= std::fwrite(&heads, sizeof(heads), 1, f) == 1;
+    ok &= std::fwrite(&d_ff, sizeof(d_ff), 1, f) == 1;
+    ok &= std::fwrite(&tied, sizeof(tied), 1, f) == 1;
+    ok &= std::fwrite(&out_bits, sizeof(out_bits), 1, f) == 1;
+    ok &= std::fwrite(&out_group, sizeof(out_group), 1, f) == 1;
+    ok &= std::fwrite(&param_count, sizeof(param_count), 1, f) == 1;
+    ok &= std::fwrite(&packed_bytes, sizeof(packed_bytes), 1, f) == 1;
+    ok &= std::fwrite(&scale_count, sizeof(scale_count), 1, f) == 1;
+
+    ok &= write_floats(f, wte_.data(), wte_.w.size());
+    ok &= write_floats(f, lnf_g_.data(), lnf_g_.w.size());
+    ok &= write_floats(f, lnf_b_.data(), lnf_b_.w.size());
+
+    for (const auto& l : layers_) {
+        ok &= write_floats(f, l.ln1.gamma.data(), l.ln1.gamma.w.size());
+        ok &= write_floats(f, l.ln1.beta.data(), l.ln1.beta.w.size());
+        ok &= write_floats(f, l.ln2.gamma.data(), l.ln2.gamma.w.size());
+        ok &= write_floats(f, l.ln2.beta.data(), l.ln2.beta.w.size());
+        for (const auto* lin : {&l.wq, &l.wk, &l.wv, &l.wo, &l.w1, &l.w2}) {
+            std::vector<uint8_t> packed;
+            std::vector<float> scales;
+            // Export the weights the model actually trained with under QAT.
+            const bool qat_ready = lin->qat_bits > 0 &&
+                lin->fake_weight.d.size() == lin->weight.w.size();
+            const float* src = qat_ready ? lin->fake_weight.data() : lin->weight.data();
+            quantize_into(src, lin->out(), lin->in(), bits, gs, packed, scales);
+            ok &= write_floats(f, lin->bias.data(), lin->bias.w.size());
+            ok &= write_bytes(f, packed);
+            ok &= write_floats(f, scales.data(), scales.size());
+        }
+    }
+
+    std::fclose(f);
+    if (!ok) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Interchange exports: GGUF v3 and safetensors
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void ex_u16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xff));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+}
+
+void ex_u32(std::vector<uint8_t>& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+}
+
+void ex_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+}
+
+void ex_f32(std::vector<uint8_t>& out, float v) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    ex_u32(out, bits);
+}
+
+void ex_string(std::vector<uint8_t>& out, const std::string& s) {
+    ex_u64(out, static_cast<uint64_t>(s.size()));
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+// IEEE-754 binary32 to binary16 with round-to-nearest-even.
+uint16_t ex_f32_to_f16(float value) {
+    uint32_t f = 0;
+    std::memcpy(&f, &value, sizeof(f));
+    const uint32_t sign = (f >> 16) & 0x8000u;
+    const uint32_t exp = (f >> 23) & 0xffu;
+    const uint32_t mant = f & 0x7fffffu;
+    if (exp == 0xffu) {
+        return static_cast<uint16_t>(sign | (mant == 0 ? 0x7c00u : 0x7e00u));
+    }
+    int32_t e = static_cast<int32_t>(exp) - 127 + 15;
+    if (e >= 0x1f) return static_cast<uint16_t>(sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return static_cast<uint16_t>(sign);
+        uint32_t m = mant | 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - e);
+        uint32_t half = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1u))) ++half;
+        return static_cast<uint16_t>(sign | half);
+    }
+    uint32_t half = mant >> 13;
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) {
+        ++half;
+        if (half == 0x400u) {
+            half = 0;
+            ++e;
+            if (e >= 0x1f) return static_cast<uint16_t>(sign | 0x7c00u);
+        }
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(e) << 10) | (half & 0x3ffu));
+}
+
+struct ExTensor {
+    std::string name;
+    std::vector<uint64_t> ne;  // GGML order: ne[0] is the innermost dimension
+    uint32_t type = 0;         // GGML type
+    const float* data = nullptr;
+    uint64_t count = 0;
+    uint64_t offset = 0;
+    std::vector<uint64_t> shape;  // row-major shape for safetensors
+};
+
+uint64_t ex_type_size(uint32_t type, uint64_t count) {
+    switch (type) {
+        case 1: return count * 2;                 // F16
+        case 2: return (count / 32) * 18;         // Q4_0
+        case 8: return (count / 32) * 34;         // Q8_0
+        default: return count * 4;                // F32
+    }
+}
+
+void ex_encode(const ExTensor& t, std::vector<uint8_t>& out) {
+    if (t.type == 1) {
+        out.reserve(static_cast<size_t>(t.count) * 2);
+        for (uint64_t i = 0; i < t.count; ++i) ex_u16(out, ex_f32_to_f16(t.data[i]));
+        return;
+    }
+    if (t.type == 8) {
+        out.reserve(static_cast<size_t>((t.count / 32) * 34));
+        for (uint64_t b = 0; b < t.count; b += 32) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(t.data[b + j]));
+            const float d = amax / 127.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            ex_u16(out, ex_f32_to_f16(d));
+            for (int j = 0; j < 32; ++j) {
+                int q = static_cast<int>(std::round(t.data[b + j] * id));
+                q = std::max(-127, std::min(127, q));
+                out.push_back(static_cast<uint8_t>(static_cast<int8_t>(q)));
+            }
+        }
+        return;
+    }
+    if (t.type == 2) {
+        out.reserve(static_cast<size_t>((t.count / 32) * 18));
+        for (uint64_t b = 0; b < t.count; b += 32) {
+            float amax = 0.0f;
+            float max = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const float v = t.data[b + j];
+                if (std::fabs(v) > amax) {
+                    amax = std::fabs(v);
+                    max = v;
+                }
+            }
+            const float d = max / -8.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            ex_u16(out, ex_f32_to_f16(d));
+            for (int j = 0; j < 16; ++j) {
+                int q0 = static_cast<int>(t.data[b + j] * id + 8.5f);
+                int q1 = static_cast<int>(t.data[b + j + 16] * id + 8.5f);
+                q0 = std::max(0, std::min(15, q0));
+                q1 = std::max(0, std::min(15, q1));
+                out.push_back(static_cast<uint8_t>(q0 | (q1 << 4)));
+            }
+        }
+        return;
+    }
+    out.reserve(static_cast<size_t>(t.count) * 4);
+    for (uint64_t i = 0; i < t.count; ++i) ex_f32(out, t.data[i]);
+}
+
+bool ex_write_file(const std::string& path, const std::vector<uint8_t>& head,
+                   const std::vector<ExTensor>& tensors) {
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool ok = head.empty() || std::fwrite(head.data(), 1, head.size(), f) == head.size();
+    const uint64_t align = 32;
+    auto pad_to = [&](uint64_t& position) {
+        const uint64_t rem = position % align;
+        if (rem == 0) return true;
+        const std::vector<uint8_t> zeros(static_cast<size_t>(align - rem), 0);
+        position += zeros.size();
+        return std::fwrite(zeros.data(), 1, zeros.size(), f) == zeros.size();
+    };
+    uint64_t position = head.size();
+    ok = ok && pad_to(position);
+    for (const auto& t : tensors) {
+        std::vector<uint8_t> body;
+        ex_encode(t, body);
+        ok = ok && (body.empty() || std::fwrite(body.data(), 1, body.size(), f) == body.size());
+        position += body.size();
+        ok = ok && pad_to(position);
+    }
+    std::fclose(f);
+    if (!ok) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::string ex_json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                    out += buf;
+                } else {
+                    out.push_back(c);
+                }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+bool GPT::save_gguf(const std::string& path, int ggml_type) const {
+    if (!cfg_.valid()) return false;
+    if (ggml_type != 0 && ggml_type != 1 && ggml_type != 2 && ggml_type != 8) return false;
+
+    const int d = cfg_.d_model;
+    const int V = cfg_.vocab;
+    std::vector<ExTensor> tensors;
+
+    auto add = [&](const std::string& name, std::vector<uint64_t> ne,
+                   const float* data, uint64_t count, bool quantizable) {
+        ExTensor t;
+        t.name = name;
+        t.ne = std::move(ne);
+        t.data = data;
+        t.count = count;
+        t.type = static_cast<uint32_t>(ggml_type);
+        if (ggml_type >= 2) {
+            // Block formats need a multiple of 32 along the innermost axis.
+            if (!quantizable || t.ne.empty() || (t.ne[0] % 32) != 0) {
+                t.type = 1;  // F16 fallback
+            }
+        }
+        // safetensors shape is the row-major order callers expect.
+        t.shape.assign(t.ne.rbegin(), t.ne.rend());
+        tensors.push_back(std::move(t));
+    };
+
+    add("token_embd.weight", {static_cast<uint64_t>(d), static_cast<uint64_t>(V)},
+        wte_.data(), static_cast<uint64_t>(V) * d, true);
+    add("output_norm.weight", {static_cast<uint64_t>(d)},
+        lnf_g_.data(), static_cast<uint64_t>(d), false);
+    add("output_norm.bias", {static_cast<uint64_t>(d)},
+        lnf_b_.data(), static_cast<uint64_t>(d), false);
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        const Layer& l = layers_[i];
+        const std::string p = "blk." + std::to_string(i) + ".";
+        auto lin = [&](const char* suffix, const Linear& layer) {
+            const std::string base = p + suffix;
+            add(base + ".weight",
+                {static_cast<uint64_t>(layer.in()), static_cast<uint64_t>(layer.out())},
+                layer.weight.data(), static_cast<uint64_t>(layer.in()) * layer.out(), true);
+            add(base + ".bias", {static_cast<uint64_t>(layer.out())},
+                layer.bias.data(), static_cast<uint64_t>(layer.out()), false);
+        };
+        add(p + "attn_norm.weight", {static_cast<uint64_t>(d)}, l.ln1.gamma.data(), d, false);
+        add(p + "attn_norm.bias", {static_cast<uint64_t>(d)}, l.ln1.beta.data(), d, false);
+        lin("attn_q", l.wq);
+        lin("attn_k", l.wk);
+        lin("attn_v", l.wv);
+        lin("attn_output", l.wo);
+        add(p + "ffn_norm.weight", {static_cast<uint64_t>(d)}, l.ln2.gamma.data(), d, false);
+        add(p + "ffn_norm.bias", {static_cast<uint64_t>(d)}, l.ln2.beta.data(), d, false);
+        lin("ffn_up", l.w1);
+        lin("ffn_down", l.w2);
+    }
+
+    std::vector<uint8_t> meta;
+    uint64_t kv_count = 0;
+    auto kv_string = [&](const char* key, const std::string& value) {
+        ex_string(meta, key);
+        ex_u32(meta, 8);
+        ex_string(meta, value);
+        ++kv_count;
+    };
+    auto kv_u32 = [&](const char* key, uint32_t value) {
+        ex_string(meta, key);
+        ex_u32(meta, 4);
+        ex_u32(meta, value);
+        ++kv_count;
+    };
+    auto kv_f32 = [&](const char* key, float value) {
+        ex_string(meta, key);
+        ex_u32(meta, 6);
+        ex_f32(meta, value);
+        ++kv_count;
+    };
+    auto kv_bool = [&](const char* key, bool value) {
+        ex_string(meta, key);
+        ex_u32(meta, 7);
+        meta.push_back(value ? 1 : 0);
+        ++kv_count;
+    };
+
+    kv_string("general.architecture", "modelforge");
+    kv_string("general.name", "ModelForge GPT");
+    kv_u32("general.file_type", static_cast<uint32_t>(ggml_type));
+    kv_u32("modelforge.context_length", static_cast<uint32_t>(cfg_.context));
+    kv_u32("modelforge.embedding_length", static_cast<uint32_t>(d));
+    kv_u32("modelforge.block_count", static_cast<uint32_t>(layers_.size()));
+    kv_u32("modelforge.feed_forward_length", static_cast<uint32_t>(cfg_.d_ff));
+    kv_u32("modelforge.attention.head_count", static_cast<uint32_t>(cfg_.heads));
+    kv_u32("modelforge.vocab_size", static_cast<uint32_t>(V));
+    kv_f32("modelforge.layer_norm_epsilon", kLnEps);
+    kv_string("modelforge.position_encoding", "sinusoidal");
+    kv_string("modelforge.normalization", "layernorm");
+    kv_bool("modelforge.tied_embeddings", true);
+    kv_string("modelforge.export_note",
+              "Exact ModelForge weights. llama.cpp/Ollama need RoPE + RMSNorm; "
+              "this container is for archival and tooling, not identical inference.");
+
+    std::vector<uint8_t> head;
+    ex_u32(head, 0x46554747u);  // "GGUF"
+    ex_u32(head, 3);
+    ex_u64(head, static_cast<uint64_t>(tensors.size()));
+    ex_u64(head, kv_count);
+    head.insert(head.end(), meta.begin(), meta.end());
+
+    uint64_t offset = 0;
+    for (auto& t : tensors) {
+        ex_string(head, t.name);
+        ex_u32(head, static_cast<uint32_t>(t.ne.size()));
+        for (uint64_t dim : t.ne) ex_u64(head, dim);
+        ex_u32(head, t.type);
+        t.offset = offset;
+        ex_u64(head, t.offset);
+        offset += ex_type_size(t.type, t.count);
+        offset = (offset + 31u) & ~uint64_t{31};
+    }
+    return ex_write_file(path, head, tensors);
+}
+
+bool GPT::save_safetensors(const std::string& path, bool fp16) const {
+    if (!cfg_.valid()) return false;
+    const int d = cfg_.d_model;
+    const int V = cfg_.vocab;
+    const std::string dtype = fp16 ? "F16" : "F32";
+    const uint64_t elem = fp16 ? 2 : 4;
+
+    std::vector<ExTensor> tensors;
+    auto add = [&](const std::string& name, std::vector<uint64_t> shape,
+                   const float* data, uint64_t count) {
+        ExTensor t;
+        t.name = name;
+        t.shape = std::move(shape);
+        t.data = data;
+        t.count = count;
+        tensors.push_back(std::move(t));
+    };
+
+    add("model.embed_tokens.weight",
+        {static_cast<uint64_t>(V), static_cast<uint64_t>(d)},
+        wte_.data(), static_cast<uint64_t>(V) * d);
+    add("model.norm.weight", {static_cast<uint64_t>(d)}, lnf_g_.data(), d);
+    add("model.norm.bias", {static_cast<uint64_t>(d)}, lnf_b_.data(), d);
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        const Layer& l = layers_[i];
+        const std::string p = "model.layers." + std::to_string(i) + ".";
+        auto lin = [&](const std::string& suffix, const Linear& layer) {
+            add(p + suffix + ".weight",
+                {static_cast<uint64_t>(layer.out()), static_cast<uint64_t>(layer.in())},
+                layer.weight.data(), static_cast<uint64_t>(layer.in()) * layer.out());
+            add(p + suffix + ".bias", {static_cast<uint64_t>(layer.out())},
+                layer.bias.data(), static_cast<uint64_t>(layer.out()));
+        };
+        add(p + "input_layernorm.weight", {static_cast<uint64_t>(d)}, l.ln1.gamma.data(), d);
+        add(p + "input_layernorm.bias", {static_cast<uint64_t>(d)}, l.ln1.beta.data(), d);
+        lin("self_attn.q_proj", l.wq);
+        lin("self_attn.k_proj", l.wk);
+        lin("self_attn.v_proj", l.wv);
+        lin("self_attn.o_proj", l.wo);
+        add(p + "post_attention_layernorm.weight", {static_cast<uint64_t>(d)},
+            l.ln2.gamma.data(), d);
+        add(p + "post_attention_layernorm.bias", {static_cast<uint64_t>(d)},
+            l.ln2.beta.data(), d);
+        lin("mlp.up_proj", l.w1);
+        lin("mlp.down_proj", l.w2);
+    }
+
+    // Data offsets are relative to the start of the data section and follow
+    // the tensor order exactly.
+    uint64_t cursor = 0;
+    std::string json = "{\"__metadata__\":{";
+    json += "\"format\":\"pt\",";
+    json += "\"modelforge.architecture\":\"gpt\",";
+    json += "\"modelforge.context_length\":\"" + std::to_string(cfg_.context) + "\",";
+    json += "\"modelforge.d_model\":\"" + std::to_string(d) + "\",";
+    json += "\"modelforge.layers\":\"" + std::to_string(layers_.size()) + "\",";
+    json += "\"modelforge.heads\":\"" + std::to_string(cfg_.heads) + "\",";
+    json += "\"modelforge.d_ff\":\"" + std::to_string(cfg_.d_ff) + "\",";
+    json += "\"modelforge.position_encoding\":\"sinusoidal\",";
+    json += "\"modelforge.normalization\":\"layernorm\"";
+    json += "}";
+
+    for (const auto& t : tensors) {
+        const uint64_t bytes = t.count * elem;
+        json += ",\"" + ex_json_escape(t.name) + "\":{";
+        json += "\"dtype\":\"" + dtype + "\",\"shape\":[";
+        for (size_t i = 0; i < t.shape.size(); ++i) {
+            if (i) json += ",";
+            json += std::to_string(t.shape[i]);
+        }
+        json += "],\"data_offsets\":[" + std::to_string(cursor) + "," +
+                std::to_string(cursor + bytes) + "]}";
+        cursor += bytes;
+    }
+    json += "}";
+
+    std::vector<uint8_t> head;
+    ex_u64(head, static_cast<uint64_t>(json.size()));
+    head.insert(head.end(), json.begin(), json.end());
+
+    std::vector<ExTensor> payload;
+    payload.reserve(tensors.size());
+    for (auto& t : tensors) {
+        t.type = fp16 ? 1u : 0u;
+        payload.push_back(t);
+    }
+    // The generic writer pads between tensors, which safetensors forbids:
+    // offsets must be exactly contiguous. Write this format directly.
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(head.data(), 1, head.size(), f) == head.size();
+    for (const auto& t : payload) {
+        std::vector<uint8_t> body;
+        ex_encode(t, body);
+        ok = ok && (body.empty() || std::fwrite(body.data(), 1, body.size(), f) == body.size());
+    }
+    std::fclose(f);
+    if (!ok) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool PackedModel::load(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    int32_t magic = 0, version = 0;
+    int32_t vocab = 0, context = 0, d_model = 0, layers = 0, heads = 0, d_ff = 0, tied = 0;
+    int32_t bits = 0, group = 32;
+    int64_t param_count = 0, packed_bytes = 0, scale_count = 0;
+
+    bool ok = true;
+    ok &= std::fread(&magic, sizeof(magic), 1, f) == 1;
+    ok &= std::fread(&version, sizeof(version), 1, f) == 1;
+    ok &= std::fread(&vocab, sizeof(vocab), 1, f) == 1;
+    ok &= std::fread(&context, sizeof(context), 1, f) == 1;
+    ok &= std::fread(&d_model, sizeof(d_model), 1, f) == 1;
+    ok &= std::fread(&layers, sizeof(layers), 1, f) == 1;
+    ok &= std::fread(&heads, sizeof(heads), 1, f) == 1;
+    ok &= std::fread(&d_ff, sizeof(d_ff), 1, f) == 1;
+    ok &= std::fread(&tied, sizeof(tied), 1, f) == 1;
+    ok &= std::fread(&bits, sizeof(bits), 1, f) == 1;
+    ok &= std::fread(&group, sizeof(group), 1, f) == 1;
+    ok &= std::fread(&param_count, sizeof(param_count), 1, f) == 1;
+    ok &= std::fread(&packed_bytes, sizeof(packed_bytes), 1, f) == 1;
+    ok &= std::fread(&scale_count, sizeof(scale_count), 1, f) == 1;
+
+    ModelConfig cfg;
+    cfg.vocab = vocab;
+    cfg.context = context;
+    cfg.d_model = d_model;
+    cfg.layers = layers;
+    cfg.heads = heads;
+    cfg.d_ff = d_ff;
+    cfg.tied_embeddings = tied != 0;
+    const bool legacy_positions = version == 1;
+    const int64_t expected_params = cfg.param_count() +
+        (legacy_positions ? static_cast<int64_t>(context) * d_model : 0);
+    if (!ok || magic != kPackedMagic ||
+        (version != 1 && version != kPackedVersion) ||
+        !cfg.valid() || expected_params != param_count ||
+        !packed_bits_ok(bits) || group <= 0) {
+        std::fclose(f);
+        return false;
+    }
+
+    cfg_ = cfg;
+    bits_ = bits;
+    group_ = group;
+    layers_.clear();
+    layers_.resize(static_cast<size_t>(cfg.layers));
+
+    wte_.init(cfg.vocab, cfg.d_model);
+    lnf_g_.init(1, cfg.d_model);
+    lnf_b_.init(1, cfg.d_model);
+    ok &= read_floats(f, wte_.data(), wte_.size());
+    if (legacy_positions) {
+        ok &= skip_floats(f, static_cast<size_t>(cfg.context) * cfg.d_model);
+    }
+    ok &= read_floats(f, lnf_g_.data(), lnf_g_.size());
+    ok &= read_floats(f, lnf_b_.data(), lnf_b_.size());
+
+    size_t read_packed = 0;
+    size_t read_scales = 0;
+    const int d = cfg.d_model;
+    const int df = cfg.d_ff;
+    for (auto& layer : layers_) {
+        layer.ln1_gamma.init(1, d);
+        layer.ln1_beta.init(1, d);
+        layer.ln2_gamma.init(1, d);
+        layer.ln2_beta.init(1, d);
+        ok &= read_floats(f, layer.ln1_gamma.data(), layer.ln1_gamma.size());
+        ok &= read_floats(f, layer.ln1_beta.data(), layer.ln1_beta.size());
+        ok &= read_floats(f, layer.ln2_gamma.data(), layer.ln2_gamma.size());
+        ok &= read_floats(f, layer.ln2_beta.data(), layer.ln2_beta.size());
+
+        PackedLinear* lins[6] = {&layer.wq, &layer.wk, &layer.wv,
+                                 &layer.wo, &layer.w1, &layer.w2};
+        const int outs[6] = {d, d, d, d, df, d};
+        const int ins[6] = {d, d, d, d, d, df};
+        for (int i = 0; i < 6; ++i) {
+            PackedLinear& lin = *lins[i];
+            lin.out = outs[i];
+            lin.in = ins[i];
+            lin.bits = bits;
+            lin.group = group;
+            lin.bias.assign(static_cast<size_t>(lin.out), 0.0f);
+            ok &= read_floats(f, lin.bias.data(), lin.bias.size());
+            const size_t pb = lin.packed_bytes();
+            const size_t sc = static_cast<size_t>(lin.out) * lin.groups();
+            lin.q.assign(pb, 0);
+            lin.scales.assign(sc, 0.0f);
+            ok &= read_bytes(f, lin.q);
+            ok &= read_floats(f, lin.scales.data(), lin.scales.size());
+            read_packed += pb;
+            read_scales += sc;
+        }
+    }
+
+    std::fclose(f);
+    if (!ok || read_packed != static_cast<size_t>(packed_bytes) ||
+        read_scales != static_cast<size_t>(scale_count)) {
+        layers_.clear();
+        return false;
+    }
+    cache_ = ForwardCache{};
+    return true;
+}
+
+void PackedModel::forward(const int* tokens, int B, int T) const {
+    if (!cfg_.valid() || tokens == nullptr || B <= 0 || T <= 0 || T > cfg_.context) {
+        cache_ = ForwardCache{};
+        return;
+    }
+    const int d = cfg_.d_model;
+    const int V = cfg_.vocab;
+    const int64_t count = static_cast<int64_t>(B) * static_cast<int64_t>(T);
+    if (count <= 0 || count > (int64_t{1} << 24) ||
+        !tokens_in_range(tokens, static_cast<int>(count), V)) {
+        cache_ = ForwardCache{};
+        return;
+    }
+    const int n = static_cast<int>(count);
+
+    cache_.B = B;
+    cache_.T = T;
+    cache_.tokens.assign(tokens, tokens + n);
+    cache_.layers.resize(static_cast<size_t>(cfg_.layers));
+
+    Tensor cur(n, d);
+    for (int i = 0; i < n; ++i) {
+        const int tok = tokens[i];
+        const int pos = i % T;
+        const float* te = wte_.row(tok);
+        float* xr = cur.row(i);
+        for (int j = 0; j < d; ++j) xr[j] = te[j];
+        add_positional(pos, d, xr);
+    }
+    cache_.x0 = cur;
+
+    for (int l = 0; l < cfg_.layers; ++l) {
+        const PackedLayer& layer = layers_[static_cast<size_t>(l)];
+        LayerCache& lc = cache_.layers[static_cast<size_t>(l)];
+
+        lc.xin = cur;
+        layernorm_forward(cur, layer.ln1_gamma.data(), layer.ln1_beta.data(),
+                          lc.ln1, lc.inv1, kLnEps);
+        matmul_packed(lc.ln1, layer.wq, lc.q);
+        matmul_packed(lc.ln1, layer.wk, lc.k);
+        matmul_packed(lc.ln1, layer.wv, lc.v);
+
+        attention_forward(cfg_, lc, B, T);
+
+        matmul_packed(lc.attn_out, layer.wo, lc.proj);
+        lc.xmid.ensure(n, d);
+        for (int i = 0; i < n; ++i) {
+            const float* a = cur.row(i);
+            const float* b = lc.proj.row(i);
+            float* o = lc.xmid.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+
+        layernorm_forward(lc.xmid, layer.ln2_gamma.data(), layer.ln2_beta.data(),
+                          lc.ln2, lc.inv2, kLnEps);
+        matmul_packed(lc.ln2, layer.w1, lc.h1pre);
+        gelu_forward(lc.h1pre, lc.h1);
+        matmul_packed(lc.h1, layer.w2, lc.h2);
+
+        Tensor next(n, d);
+        for (int i = 0; i < n; ++i) {
+            const float* a = lc.xmid.row(i);
+            const float* b = lc.h2.row(i);
+            float* o = next.row(i);
+            for (int j = 0; j < d; ++j) o[j] = a[j] + b[j];
+        }
+        cur = std::move(next);
+    }
+
+    cache_.final_in = cur;
+    layernorm_forward(cur, lnf_g_.data(), lnf_b_.data(), cache_.lnf, cache_.invf, kLnEps);
+    matmul_nt_raw(cache_.lnf, wte_.data(), V, cache_.logits);
+}
+
+std::vector<int> PackedModel::generate(const std::vector<int>& prompt, int max_new,
+                                       float temperature, int top_k, float top_p,
+                                       uint64_t seed) const {
+    std::vector<int> seq = prompt;
+    if (seq.empty()) seq.push_back(0);
+    if (max_new <= 0) return {};
+    const int V = cfg_.vocab;
+    std::mt19937_64 rng(seed);
+    std::vector<int> generated;
+    generated.reserve(max_new);
+
+    for (int step = 0; step < max_new; ++step) {
+        const int start = std::max(0, static_cast<int>(seq.size()) - cfg_.context);
+        const int T = static_cast<int>(seq.size()) - start;
+        forward(seq.data() + start, 1, T);
+        const float* logits = cache_.logits.row(T - 1);
+
+        int next = 0;
+        if (temperature <= 0.0f) {
+            next = static_cast<int>(std::max_element(logits, logits + V) - logits);
+        } else {
+            std::vector<int> idx(V);
+            for (int i = 0; i < V; ++i) idx[i] = i;
+            std::vector<float> scaled(V);
+            for (int i = 0; i < V; ++i) scaled[i] = logits[i] / std::max(1e-5f, temperature);
+
+            int keep = V;
+            if (top_k > 0 && top_k < V) {
+                keep = top_k;
+                std::partial_sort(idx.begin(), idx.begin() + keep, idx.end(),
+                                  [&](int a, int b) { return scaled[a] > scaled[b]; });
+            } else {
+                std::sort(idx.begin(), idx.end(),
+                          [&](int a, int b) { return scaled[a] > scaled[b]; });
+            }
+
+            std::vector<float> probs(keep);
+            float mx = -1e30f;
+            for (int i = 0; i < keep; ++i) mx = std::max(mx, scaled[idx[i]]);
+            float sum = 0.0f;
+            for (int i = 0; i < keep; ++i) {
+                probs[i] = std::exp(scaled[idx[i]] - mx);
+                sum += probs[i];
+            }
+            for (int i = 0; i < keep; ++i) probs[i] /= sum;
+
+            int cutoff = keep;
+            if (top_p > 0.0f && top_p < 1.0f) {
+                float cumulative = 0.0f;
+                for (int i = 0; i < keep; ++i) {
+                    cumulative += probs[i];
+                    if (cumulative >= top_p) {
+                        cutoff = i + 1;
+                        break;
+                    }
+                }
+            }
+            float renorm = 0.0f;
+            for (int i = 0; i < cutoff; ++i) renorm += probs[i];
+            std::uniform_real_distribution<float> uni(0.0f, renorm);
+            const float target = uni(rng);
+            float acc = 0.0f;
+            next = idx[cutoff - 1];
+            for (int i = 0; i < cutoff; ++i) {
+                acc += probs[i];
+                if (target <= acc) {
+                    next = idx[i];
+                    break;
+                }
+            }
+        }
+        seq.push_back(next);
+        generated.push_back(next);
+    }
+    return generated;
+}
+
+} // namespace mf

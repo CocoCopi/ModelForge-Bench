@@ -1,0 +1,27 @@
+# Gradle and Android build output
+.gradle/
+build/
+*/build/
+app/build/
+build-native/
+.cxx/
+.externalNativeBuild/
+cmake-build-*/
+
+# Local machine configuration
+local.properties
+*.iml
+.idea/
+.vscode/
+.DS_Store
+
+# Signing material must never be committed
+*.keystore
+*.jks
+keystore/
+signing/
+
+# Generated reports and captured output
+*.apk
+*.aab
+!app/release/*.apk

@@ -1,0 +1,34 @@
+{"id": "smoke-01", "category": "science", "question": "Which planet is closest to the Sun?", "choices": ["Mercury", "Venus", "Earth", "Mars"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-02", "category": "science", "question": "At sea level, water freezes at what temperature?", "choices": ["100 °C", "0 °C", "10 °C", "50 °C"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-03", "category": "science", "question": "Which gas do plants absorb during photosynthesis?", "choices": ["Hydrogen", "Oxygen", "Carbon dioxide", "Nitrogen"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-04", "category": "science", "question": "Which organ pumps blood around the body?", "choices": ["Liver", "Lungs", "Kidney", "Heart"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-05", "category": "science", "question": "What is the chemical symbol for gold?", "choices": ["Au", "Gd", "Go", "Ag"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-06", "category": "science", "question": "How many bones are in the adult human body?", "choices": ["186", "206", "226", "246"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-07", "category": "science", "question": "Which ocean is the largest?", "choices": ["Arctic", "Atlantic", "Pacific", "Indian"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-08", "category": "science", "question": "Which animal is a mammal?", "choices": ["Shark", "Trout", "Frog", "Dolphin"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-09", "category": "science", "question": "At sea level, water boils at what temperature?", "choices": ["100 °C", "120 °C", "50 °C", "90 °C"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-10", "category": "science", "question": "Which gas is most abundant in Earth's atmosphere?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Argon"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-11", "category": "math", "question": "What is 7 × 8?", "choices": ["64", "54", "56", "58"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-12", "category": "math", "question": "What is 15% of 200?", "choices": ["40", "15", "20", "30"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-13", "category": "math", "question": "A train covers 60 km in 45 minutes. What is its average speed?", "choices": ["80 km/h", "90 km/h", "60 km/h", "75 km/h"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-14", "category": "math", "question": "What comes next: 2, 4, 8, 16, ?", "choices": ["24", "32", "64", "20"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-15", "category": "math", "question": "A rectangle is 5 m by 3 m. What is its area?", "choices": ["30 m²", "8 m²", "15 m²", "16 m²"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-16", "category": "math", "question": "What is 100 − 37?", "choices": ["67", "73", "77", "63"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-17", "category": "math", "question": "What is 9 × 9?", "choices": ["81", "90", "99", "72"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-18", "category": "math", "question": "What is half of 46?", "choices": ["22", "23", "24", "21"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-19", "category": "language", "question": "Which word is a synonym of 'quick'?", "choices": ["Heavy", "Slow", "Rapid", "Tired"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-20", "category": "language", "question": "Which sentence is grammatically correct?", "choices": ["She going to school.", "She gone to school.", "She go to school.", "She goes to school."], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-21", "category": "language", "question": "What is the plural of 'child'?", "choices": ["children", "childes", "childrens", "childs"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-22", "category": "language", "question": "Which word is the opposite of 'ancient'?", "choices": ["Old", "Modern", "Large", "Quiet"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-23", "category": "language", "question": "Choose the correct spelling.", "choices": ["Receve", "Recieve", "Receive", "Receeve"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-24", "category": "language", "question": "In 'The dog barked loudly', which word is a noun?", "choices": ["barked", "loudly", "The", "dog"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-25", "category": "language", "question": "Which word is the opposite of 'begin'?", "choices": ["end", "open", "fast", "start"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-26", "category": "language", "question": "In 'Birds fly high', which word is a verb?", "choices": ["Birds", "fly", "high", "none"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-27", "category": "commonsense", "question": "What do you use to unlock a door?", "choices": ["spoon", "pen", "key", "cup"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-28", "category": "commonsense", "question": "If you put water in a freezer, what happens?", "choices": ["It turns to stone", "It boils", "It evaporates", "It freezes"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-29", "category": "commonsense", "question": "What is the safest action when a traffic light is red?", "choices": ["Stop", "Accelerate", "Honk", "Reverse"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-30", "category": "commonsense", "question": "A person who cannot see is most likely to use what?", "choices": ["ladder", "cane", "compass", "hammer"], "answer": 1, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-31", "category": "commonsense", "question": "Which item is typically used to write on paper?", "choices": ["cup", "shoe", "pencil", "key"], "answer": 2, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-32", "category": "commonsense", "question": "What should you do before eating fruit?", "choices": ["Paint it", "Freeze it", "Bury it", "Wash it"], "answer": 3, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-33", "category": "commonsense", "question": "Which object is dangerous to touch?", "choices": ["A hot stove", "A pillow", "A book", "A towel"], "answer": 0, "source": "authored by ModelForge, 2026"}
+{"id": "smoke-34", "category": "commonsense", "question": "How does ice feel?", "choices": ["hot", "cold", "dry", "loud"], "answer": 1, "source": "authored by ModelForge, 2026"}

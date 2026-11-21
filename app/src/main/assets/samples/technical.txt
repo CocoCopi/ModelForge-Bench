@@ -1,0 +1,24 @@
+A reliable program is mostly a collection of small promises. Each function
+states what it needs, what it returns, and what it refuses to accept. When
+those promises are clear, the code can be read in pieces without holding the
+whole system in mind. When they are vague, every change becomes a guess, and
+the guess is usually wrong in a way that appears only in production.
+
+Performance work begins with measurement, not intuition. A profiler turns a
+vague complaint into a ranked list of costs, and the top of that list is
+often a surprise. Moving data usually costs more than multiplying it. A loop
+that reads memory in a friendly order can be several times faster than one
+that jumps between distant addresses, even when both perform the same number
+of arithmetic operations.
+
+Caching is a trade between time and truth. A cache that is correct is a
+shortcut; a cache that is stale is a bug with a friendly interface. Good
+systems make the lifetime explicit, invalidate on write, and measure the hit
+rate rather than assuming it. They also fail safely: if the cache is empty,
+the request still succeeds, only more slowly.
+
+Tests are how a team keeps a promise after the person who made it has moved
+on. The most valuable tests describe behaviour at the edges, where inputs are
+empty, duplicated, too large, or interrupted halfway through. Those cases are
+rare in development and common in the real world. A test suite that only
+covers the happy path is a description of a program that does not exist.
